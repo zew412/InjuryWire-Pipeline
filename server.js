@@ -64,43 +64,103 @@ async function initDB() {
   }
 }
 
-// ─── ROSTER (player → position) ──────────────────────────────────────────────
-// Covers ~200 active NBA players. Falls back to null if not found.
-const ROSTER = {
-  // Guards
-  "Stephen Curry":"PG","Damian Lillard":"PG","Ja Morant":"PG","Trae Young":"PG",
-  "Luka Doncic":"PG","Tyrese Haliburton":"PG","Shai Gilgeous-Alexander":"PG",
-  "Donovan Mitchell":"SG","Devin Booker":"SG","Jaylen Brown":"SG","Zach LaVine":"SG",
-  "CJ McCollum":"SG","Khris Middleton":"SG","Anthony Edwards":"SG","Jordan Poole":"SG",
-  "De'Aaron Fox":"PG","Fred VanVleet":"PG","Kyle Lowry":"PG","Chris Paul":"PG",
-  "Russell Westbrook":"PG","Mike Conley":"PG","Marcus Smart":"PG","Jrue Holiday":"PG",
-  "Tyrese Maxey":"PG","Dejounte Murray":"PG","LaMelo Ball":"PG","Josh Giddey":"PG",
-  "James Harden":"PG","D'Angelo Russell":"PG","Klay Thompson":"SG","Buddy Hield":"SG",
-  "Tyler Herro":"SG","Darius Garland":"PG","Cade Cunningham":"PG","Scoot Henderson":"PG",
-  // Forwards/Wings
-  "LeBron James":"SF","Kevin Durant":"SF","Jayson Tatum":"SF","Paul George":"SF",
-  "Kawhi Leonard":"SF","Jimmy Butler":"SF","Pascal Siakam":"SF","Bam Adebayo":"PF",
-  "Draymond Green":"PF","Julius Randle":"PF","Zion Williamson":"PF","Brandon Ingram":"SF",
-  "Lauri Markkanen":"PF","OG Anunoby":"SF","Scottie Barnes":"SF","Paolo Banchero":"PF",
-  "Franz Wagner":"SF","Mikal Bridges":"SF","Andrew Wiggins":"SF","Harrison Barnes":"SF",
-  "Tobias Harris":"PF","Al Horford":"PF","Domantas Sabonis":"PF","John Collins":"PF",
-  "Evan Mobley":"PF","Onyeka Okongwu":"PF","Jabari Smith Jr.":"PF","Walker Kessler":"C",
-  "Aaron Gordon":"PF","Miles Bridges":"PF","Gordon Hayward":"SF","P.J. Tucker":"PF",
-  "Bruce Brown":"SF","Jerami Grant":"PF","Jalen Johnson":"SF","Keegan Murray":"SF",
-  // Centers
-  "Nikola Jokic":"C","Joel Embiid":"C","Giannis Antetokounmpo":"PF","Karl-Anthony Towns":"C",
-  "Rudy Gobert":"C","Anthony Davis":"C","Deandre Ayton":"C","Myles Turner":"C",
-  "Brook Lopez":"C","Clint Capela":"C","Jarrett Allen":"C","Steven Adams":"C",
-  "Jonas Valanciunas":"C","Kristaps Porzingis":"C","Mitchell Robinson":"C",
-  "Alperen Sengun":"C","Victor Wembanyama":"C","Chet Holmgren":"C","Ivica Zubac":"C",
-  "Nikola Vucevic":"C","Isaiah Stewart":"C","Daniel Gafford":"C","Naz Reid":"C",
-  // Stars with common name variants
-  "KAT":"C","Ant":"SG","SGA":"PG","Wemby":"C","Dame":"PG","Bron":"SF",
+// ─── ROSTER CACHE (from balldontlie /v1/players/active) ──────────────────────
+// Maps canonical full name → { team, position }
+// Refreshed every 24 hours. Falls back to ROSTER_FALLBACK if API unavailable.
+let rosterCache = {};       // { "LeBron James": { team: "Los Angeles Lakers", position: "F" } }
+let rosterFetchedAt = null;
+
+// Static fallback for stars — covers the highest-injury players if API is down
+const ROSTER_FALLBACK = {
+  "Stephen Curry":{"team":"Golden State Warriors","position":"G"},
+  "LeBron James":{"team":"Los Angeles Lakers","position":"F"},
+  "Anthony Davis":{"team":"Los Angeles Lakers","position":"F"},
+  "Nikola Jokic":{"team":"Denver Nuggets","position":"C"},
+  "Joel Embiid":{"team":"Philadelphia 76ers","position":"C"},
+  "Giannis Antetokounmpo":{"team":"Milwaukee Bucks","position":"F"},
+  "Luka Doncic":{"team":"Dallas Mavericks","position":"G"},
+  "Jayson Tatum":{"team":"Boston Celtics","position":"F"},
+  "Shai Gilgeous-Alexander":{"team":"Oklahoma City Thunder","position":"G"},
+  "Kevin Durant":{"team":"Phoenix Suns","position":"F"},
+  "Damian Lillard":{"team":"Milwaukee Bucks","position":"G"},
+  "Ja Morant":{"team":"Memphis Grizzlies","position":"G"},
+  "Zion Williamson":{"team":"New Orleans Pelicans","position":"F"},
+  "Karl-Anthony Towns":{"team":"Minnesota Timberwolves","position":"C"},
+  "Bam Adebayo":{"team":"Miami Heat","position":"C"},
+  "Kawhi Leonard":{"team":"LA Clippers","position":"F"},
+  "Paul George":{"team":"Philadelphia 76ers","position":"F"},
+  "Jimmy Butler":{"team":"Miami Heat","position":"F"},
+  "Donovan Mitchell":{"team":"Cleveland Cavaliers","position":"G"},
+  "Victor Wembanyama":{"team":"San Antonio Spurs","position":"C"},
+  "Anthony Edwards":{"team":"Minnesota Timberwolves","position":"G"},
+  "Tyrese Haliburton":{"team":"Indiana Pacers","position":"G"},
+  "Scottie Barnes":{"team":"Toronto Raptors","position":"F"},
+  "Paolo Banchero":{"team":"Orlando Magic","position":"F"},
+  "Chet Holmgren":{"team":"Oklahoma City Thunder","position":"C"},
 };
 
-function getPosition(playerName) {
+async function fetchRoster() {
+  const BDLKEY = process.env.BALLDONTLIE_KEY;
+  if (!BDLKEY) return;
+  if (rosterFetchedAt && (Date.now() - rosterFetchedAt) < 86400000) return; // 24h cache
+
+  console.log('[Roster] Fetching active players from balldontlie...');
+  const built = {};
+  let cursor = null;
+  let pages = 0;
+
+  try {
+    do {
+      const params = { per_page: 100 };
+      if (cursor) params.cursor = cursor;
+      const res = await axios.get('https://api.balldontlie.io/v1/players/active', {
+        headers: { Authorization: BDLKEY },
+        params,
+        timeout: 10000,
+      });
+      const players = res.data?.data || [];
+      for (const p of players) {
+        const name = `${p.first_name} ${p.last_name}`.trim();
+        if (!name) continue;
+        built[name] = {
+          team:     p.team?.full_name || null,
+          position: p.position || null,   // "G", "F", "C", "G-F", "F-C" etc.
+        };
+      }
+      cursor = res.data?.meta?.next_cursor || null;
+      pages++;
+      if (pages > 10) break; // safety cap
+      if (cursor) await new Promise(r => setTimeout(r, 200));
+    } while (cursor);
+
+    rosterCache = built;
+    rosterFetchedAt = Date.now();
+    console.log(`[Roster] Cached ${Object.keys(built).length} players across ${pages} page(s) ✓`);
+  } catch (err) {
+    console.warn('[Roster] Fetch failed, using fallback:', err.message);
+    if (!Object.keys(rosterCache).length) rosterCache = { ...ROSTER_FALLBACK };
+  }
+}
+
+function getRosterEntry(playerName) {
   if (!playerName) return null;
-  return ROSTER[playerName] || null;
+  // Exact match first
+  if (rosterCache[playerName]) return rosterCache[playerName];
+  // Case-insensitive fallback
+  const lower = playerName.toLowerCase();
+  for (const [k, v] of Object.entries(rosterCache)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return ROSTER_FALLBACK[playerName] || null;
+}
+
+function getPosition(playerName) {
+  return getRosterEntry(playerName)?.position || null;
+}
+
+// Returns true if name is a known active NBA player
+function isKnownPlayer(name) {
+  return !!getRosterEntry(name);
 }
 
 // ─── NBA SCHEDULE CACHE ───────────────────────────────────────────────────────
@@ -312,11 +372,28 @@ function extractPlayer(text) {
     /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,3})\s+(?:–|—|-)\s+(?:ankle|knee|quad|hamstring|achilles|back|shoulder|hip|calf|wrist)/i,
   ];
   const skipWords = /^(The|This|He|She|They|We|His|Her|Per|Via|From|With|For|Breaking|Sources|Report|Update|According)/i;
+
+  const candidates = [];
   for (const p of patterns) {
     const m = text.match(p);
-    if (m?.[1] && m[1].length > 3 && !skipWords.test(m[1])) return m[1].trim();
+    if (m?.[1] && m[1].length > 3 && !skipWords.test(m[1])) {
+      candidates.push(m[1].trim());
+    }
   }
-  return null;
+
+  // Prefer a candidate that is a known active player
+  for (const name of candidates) {
+    if (isKnownPlayer(name)) return name;
+  }
+
+  // Also scan the full roster for a name mentioned anywhere in the tweet
+  const lowerText = text.toLowerCase();
+  for (const name of Object.keys(rosterCache)) {
+    if (lowerText.includes(name.toLowerCase())) return name;
+  }
+
+  // Last resort: return best regex candidate even if not in roster
+  return candidates[0] || null;
 }
 
 function calcConfidence(reporter, status, tweetText, corrobCount = 0) {
@@ -404,7 +481,8 @@ const TWEETAPI_KEY = process.env.TWEETAPI_KEY;
 async function poll() {
   if (!TWEETAPI_KEY) { console.log('[Poll] No TWEETAPI_KEY — skipping'); return; }
 
-  // Refresh schedule each poll (cached internally for 1hr)
+  // Refresh roster daily, schedule each poll (cached internally for 1hr/24hr)
+  await fetchRoster();
   await fetchSchedule();
 
   const tier1 = REPORTERS.filter(r => r.tier === 1).map(r => `from:${r.handle}`).join(' OR ');
@@ -448,9 +526,15 @@ async function poll() {
     const status    = extractStatus(tweet.text);
     const body_part = extractBodyPart(tweet.text);
     const injury_type = extractInjuryType(tweet.text);
-    const position  = getPosition(player);
+
+    // Use live roster for authoritative team/position
+    const rosterEntry = getRosterEntry(player);
+    const position  = rosterEntry?.position || null;
+    const team      = rosterEntry?.team
+      || (reporter.team === 'All Teams' ? 'Unknown' : reporter.team);
+
     const confidence = calcConfidence(reporter, status, tweet.text);
-    const gameInfo  = getGameInfo(reporter.team === 'All Teams' ? 'Unknown' : reporter.team);
+    const gameInfo  = getGameInfo(team);
     const tweetTime = tweet.created_at ? new Date(tweet.created_at) : new Date();
 
     // Look up history for this player
@@ -463,7 +547,7 @@ async function poll() {
       tweet_id:    tweet.id,
       player,
       position,
-      team:        reporter.team === 'All Teams' ? 'Unknown' : reporter.team,
+      team,
       status,
       injury_type,
       body_part,
@@ -508,6 +592,20 @@ function auth(req, res, next) {
   if (provided !== key) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
+
+// ── Roster proxy — dashboard fetches this to build its player lookup dynamically
+app.get('/proxy/roster', async (req, res) => {
+  // Ensure roster is loaded
+  if (!Object.keys(rosterCache).length) await fetchRoster();
+  const data = Object.keys(rosterCache).length ? rosterCache : ROSTER_FALLBACK;
+  res.json({ roster: data, count: Object.keys(data).length, fetched_at: rosterFetchedAt });
+});
+
+// ── Schedule proxy — dashboard fetches this for matchup/game time per team
+app.get('/proxy/schedule', async (req, res) => {
+  if (!Object.keys(scheduleCache).length) await fetchSchedule();
+  res.json({ schedule: scheduleCache, fetched_at: scheduleFetchedAt });
+});
 
 app.get('/health', (req, res) => {
   res.json({
@@ -565,6 +663,9 @@ app.get('/v1/players/:player', auth, async (req, res) => {
 // ─── START ────────────────────────────────────────────────────────────────────
 async function start() {
   await initDB();
+
+  // Seed fallback roster immediately so first poll has something to match against
+  rosterCache = { ...ROSTER_FALLBACK };
 
   // Load last 24h from DB into memory on startup
   const existing = await loadRecentFromDB(24);
