@@ -18,7 +18,16 @@ const cors    = require('cors');
 const { Pool } = require('pg');
 
 const app  = express();
-app.use(cors());
+
+// ─── CORS — allow GitHub Pages (and any origin) with preflight support ───────
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-Api-Key', 'Authorization'],
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));   // explicit preflight handler
+
 const PORT = process.env.PORT || 3000;
 
 // ─── DATABASE ─────────────────────────────────────────────────────────────────
