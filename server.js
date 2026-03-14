@@ -1060,8 +1060,6 @@ async function poll() {
     const team      = rosterEntry?.team
       || (reporter.team === 'All Teams' ? 'Unknown' : reporter.team);
 
-    const confidence = calcConfidence(reporter, status, tweet.text, 0, { daysSinceLastReport: days_since_last_report });
-    const gameInfo  = getGameInfo(team, tweet.text, tweetTime);
     const tweetTime = tweet.created_at ? new Date(tweet.created_at) : new Date();
 
     // Look up history for this player
@@ -1069,6 +1067,9 @@ async function poll() {
       getPrevStatus(player),
       getDaysSinceLastReport(player),
     ]);
+
+    const confidence = calcConfidence(reporter, status, tweet.text, 0, { daysSinceLastReport: days_since_last_report });
+    const gameInfo  = getGameInfo(team, tweet.text, tweetTime);
 
     const report = {
       tweet_id:    tweet.id,
