@@ -125,7 +125,7 @@ const ROSTER_FALLBACK = {
   // Golden State Warriors
   "Stephen Curry":{"team":"Golden State Warriors","position":"G"},
   "Draymond Green":{"team":"Golden State Warriors","position":"F"},
-  "Andrew Wiggins":{"team":"Golden State Warriors","position":"F"},
+  "Andrew Wiggins":{"team":"Miami Heat","position":"F"},
   "Jonathan Kuminga":{"team":"Golden State Warriors","position":"F"},
   // Houston Rockets
   "Kevin Durant":{"team":"Houston Rockets","position":"F"},
@@ -142,7 +142,7 @@ const ROSTER_FALLBACK = {
   "Khris Middleton":{"team":"Milwaukee Bucks","position":"F"},
   // Miami Heat
   "Bam Adebayo":{"team":"Miami Heat","position":"C"},
-  "Jimmy Butler":{"team":"Miami Heat","position":"F"},
+  "Jimmy Butler":{"team":"Golden State Warriors","position":"F"},
   "Tyler Herro":{"team":"Miami Heat","position":"G"},
   // Indiana Pacers
   "Tyrese Haliburton":{"team":"Indiana Pacers","position":"G"},
@@ -187,7 +187,7 @@ const ROSTER_FALLBACK = {
   // LA Clippers
   "Kawhi Leonard":{"team":"LA Clippers","position":"F"},
   "Ivica Zubac":{"team":"LA Clippers","position":"C"},
-  "Norman Powell":{"team":"LA Clippers","position":"G"},
+  "Norman Powell":{"team":"Miami Heat","position":"G"},
   // Charlotte Hornets
   "LaMelo Ball":{"team":"Charlotte Hornets","position":"G"},
   "Brandon Miller":{"team":"Charlotte Hornets","position":"F"},
