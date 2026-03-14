@@ -51,6 +51,7 @@ async function initDB() {
         days_since_last_report INTEGER,
         tweet_text            TEXT,
         corroborators         TEXT[],
+        corrob_tweets         JSONB DEFAULT '[]',
         created_at            TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_player   ON injury_reports(player);
@@ -71,32 +72,138 @@ let rosterCache = {};       // { "LeBron James": { team: "Los Angeles Lakers", p
 let rosterFetchedAt = null;
 
 // Static fallback for stars — covers the highest-injury players if API is down
+// Updated March 2026
 const ROSTER_FALLBACK = {
-  "Stephen Curry":{"team":"Golden State Warriors","position":"G"},
+  // Los Angeles Lakers
+  "Luka Doncic":{"team":"Los Angeles Lakers","position":"G"},
   "LeBron James":{"team":"Los Angeles Lakers","position":"F"},
-  "Anthony Davis":{"team":"Los Angeles Lakers","position":"F"},
-  "Nikola Jokic":{"team":"Denver Nuggets","position":"C"},
-  "Joel Embiid":{"team":"Philadelphia 76ers","position":"C"},
-  "Giannis Antetokounmpo":{"team":"Milwaukee Bucks","position":"F"},
-  "Luka Doncic":{"team":"Dallas Mavericks","position":"G"},
-  "Jayson Tatum":{"team":"Boston Celtics","position":"F"},
-  "Shai Gilgeous-Alexander":{"team":"Oklahoma City Thunder","position":"G"},
-  "Kevin Durant":{"team":"Phoenix Suns","position":"F"},
-  "Damian Lillard":{"team":"Milwaukee Bucks","position":"G"},
-  "Ja Morant":{"team":"Memphis Grizzlies","position":"G"},
-  "Zion Williamson":{"team":"New Orleans Pelicans","position":"F"},
-  "Karl-Anthony Towns":{"team":"Minnesota Timberwolves","position":"C"},
-  "Bam Adebayo":{"team":"Miami Heat","position":"C"},
-  "Kawhi Leonard":{"team":"LA Clippers","position":"F"},
-  "Paul George":{"team":"Philadelphia 76ers","position":"F"},
-  "Jimmy Butler":{"team":"Miami Heat","position":"F"},
-  "Donovan Mitchell":{"team":"Cleveland Cavaliers","position":"G"},
-  "Victor Wembanyama":{"team":"San Antonio Spurs","position":"C"},
+  "Austin Reaves":{"team":"Los Angeles Lakers","position":"G"},
+  "Marcus Smart":{"team":"Los Angeles Lakers","position":"G"},
+  "Rui Hachimura":{"team":"Los Angeles Lakers","position":"F"},
+  // Dallas Mavericks
+  "Cooper Flagg":{"team":"Dallas Mavericks","position":"F"},
+  "Klay Thompson":{"team":"Dallas Mavericks","position":"G"},
+  "Kyrie Irving":{"team":"Dallas Mavericks","position":"G"},
+  // Washington Wizards
+  "Anthony Davis":{"team":"Washington Wizards","position":"F"},
+  "Trae Young":{"team":"Washington Wizards","position":"G"},
+  "Alex Sarr":{"team":"Washington Wizards","position":"C"},
+  // New York Knicks
+  "Karl-Anthony Towns":{"team":"New York Knicks","position":"C"},
+  "Jalen Brunson":{"team":"New York Knicks","position":"G"},
+  "Mikal Bridges":{"team":"New York Knicks","position":"F"},
+  "OG Anunoby":{"team":"New York Knicks","position":"F"},
+  "Josh Hart":{"team":"New York Knicks","position":"G"},
+  // Minnesota Timberwolves
   "Anthony Edwards":{"team":"Minnesota Timberwolves","position":"G"},
-  "Tyrese Haliburton":{"team":"Indiana Pacers","position":"G"},
-  "Scottie Barnes":{"team":"Toronto Raptors","position":"F"},
-  "Paolo Banchero":{"team":"Orlando Magic","position":"F"},
+  "Rudy Gobert":{"team":"Minnesota Timberwolves","position":"C"},
+  "Julius Randle":{"team":"Minnesota Timberwolves","position":"F"},
+  "Jaden McDaniels":{"team":"Minnesota Timberwolves","position":"F"},
+  // Oklahoma City Thunder
+  "Shai Gilgeous-Alexander":{"team":"Oklahoma City Thunder","position":"G"},
+  "Jalen Williams":{"team":"Oklahoma City Thunder","position":"G"},
   "Chet Holmgren":{"team":"Oklahoma City Thunder","position":"C"},
+  "Alex Caruso":{"team":"Oklahoma City Thunder","position":"G"},
+  "Isaiah Hartenstein":{"team":"Oklahoma City Thunder","position":"C"},
+  // Boston Celtics
+  "Jayson Tatum":{"team":"Boston Celtics","position":"F"},
+  "Jaylen Brown":{"team":"Boston Celtics","position":"G"},
+  "Kristaps Porzingis":{"team":"Boston Celtics","position":"C"},
+  "Jrue Holiday":{"team":"Boston Celtics","position":"G"},
+  "Payton Pritchard":{"team":"Boston Celtics","position":"G"},
+  // Cleveland Cavaliers
+  "Donovan Mitchell":{"team":"Cleveland Cavaliers","position":"G"},
+  "Darius Garland":{"team":"Cleveland Cavaliers","position":"G"},
+  "Evan Mobley":{"team":"Cleveland Cavaliers","position":"F"},
+  "Jarrett Allen":{"team":"Cleveland Cavaliers","position":"C"},
+  "James Harden":{"team":"Cleveland Cavaliers","position":"G"},
+  // Denver Nuggets
+  "Nikola Jokic":{"team":"Denver Nuggets","position":"C"},
+  "Jamal Murray":{"team":"Denver Nuggets","position":"G"},
+  "Michael Porter Jr.":{"team":"Denver Nuggets","position":"F"},
+  "Aaron Gordon":{"team":"Denver Nuggets","position":"F"},
+  // Golden State Warriors
+  "Stephen Curry":{"team":"Golden State Warriors","position":"G"},
+  "Draymond Green":{"team":"Golden State Warriors","position":"F"},
+  "Andrew Wiggins":{"team":"Golden State Warriors","position":"F"},
+  "Jonathan Kuminga":{"team":"Golden State Warriors","position":"F"},
+  // Houston Rockets
+  "Kevin Durant":{"team":"Houston Rockets","position":"F"},
+  "Alperen Sengun":{"team":"Houston Rockets","position":"C"},
+  "Jalen Green":{"team":"Houston Rockets","position":"G"},
+  "Fred VanVleet":{"team":"Houston Rockets","position":"G"},
+  // Philadelphia 76ers
+  "Joel Embiid":{"team":"Philadelphia 76ers","position":"C"},
+  "Tyrese Maxey":{"team":"Philadelphia 76ers","position":"G"},
+  "Paul George":{"team":"Philadelphia 76ers","position":"F"},
+  // Milwaukee Bucks
+  "Giannis Antetokounmpo":{"team":"Milwaukee Bucks","position":"F"},
+  "Damian Lillard":{"team":"Milwaukee Bucks","position":"G"},
+  "Khris Middleton":{"team":"Milwaukee Bucks","position":"F"},
+  // Miami Heat
+  "Bam Adebayo":{"team":"Miami Heat","position":"C"},
+  "Jimmy Butler":{"team":"Miami Heat","position":"F"},
+  "Tyler Herro":{"team":"Miami Heat","position":"G"},
+  // Indiana Pacers
+  "Tyrese Haliburton":{"team":"Indiana Pacers","position":"G"},
+  "Pascal Siakam":{"team":"Indiana Pacers","position":"F"},
+  "Myles Turner":{"team":"Indiana Pacers","position":"C"},
+  // Toronto Raptors
+  "Scottie Barnes":{"team":"Toronto Raptors","position":"F"},
+  "RJ Barrett":{"team":"Toronto Raptors","position":"G"},
+  "Immanuel Quickley":{"team":"Toronto Raptors","position":"G"},
+  // Orlando Magic
+  "Paolo Banchero":{"team":"Orlando Magic","position":"F"},
+  "Franz Wagner":{"team":"Orlando Magic","position":"F"},
+  "Jalen Suggs":{"team":"Orlando Magic","position":"G"},
+  // New Orleans Pelicans
+  "Zion Williamson":{"team":"New Orleans Pelicans","position":"F"},
+  "Dejounte Murray":{"team":"New Orleans Pelicans","position":"G"},
+  "Brandon Ingram":{"team":"New Orleans Pelicans","position":"F"},
+  "CJ McCollum":{"team":"New Orleans Pelicans","position":"G"},
+  // Atlanta Hawks
+  "Jalen Johnson":{"team":"Atlanta Hawks","position":"F"},
+  "De'Andre Hunter":{"team":"Atlanta Hawks","position":"F"},
+  "Clint Capela":{"team":"Atlanta Hawks","position":"C"},
+  // Sacramento Kings
+  "De'Aaron Fox":{"team":"Sacramento Kings","position":"G"},
+  "Domantas Sabonis":{"team":"Sacramento Kings","position":"C"},
+  "DeMar DeRozan":{"team":"Sacramento Kings","position":"G"},
+  // San Antonio Spurs
+  "Victor Wembanyama":{"team":"San Antonio Spurs","position":"C"},
+  "Devin Vassell":{"team":"San Antonio Spurs","position":"G"},
+  // Utah Jazz
+  "Lauri Markkanen":{"team":"Utah Jazz","position":"F"},
+  "Jaren Jackson Jr.":{"team":"Utah Jazz","position":"F"},
+  "Collin Sexton":{"team":"Utah Jazz","position":"G"},
+  // Portland Trail Blazers
+  "Scoot Henderson":{"team":"Portland Trail Blazers","position":"G"},
+  "Anfernee Simons":{"team":"Portland Trail Blazers","position":"G"},
+  "Deni Avdija":{"team":"Portland Trail Blazers","position":"F"},
+  "Jerami Grant":{"team":"Portland Trail Blazers","position":"F"},
+  // Memphis Grizzlies
+  "Ja Morant":{"team":"Memphis Grizzlies","position":"G"},
+  "Desmond Bane":{"team":"Memphis Grizzlies","position":"G"},
+  // LA Clippers
+  "Kawhi Leonard":{"team":"LA Clippers","position":"F"},
+  "Ivica Zubac":{"team":"LA Clippers","position":"C"},
+  "Norman Powell":{"team":"LA Clippers","position":"G"},
+  // Charlotte Hornets
+  "LaMelo Ball":{"team":"Charlotte Hornets","position":"G"},
+  "Brandon Miller":{"team":"Charlotte Hornets","position":"F"},
+  // Detroit Pistons
+  "Cade Cunningham":{"team":"Detroit Pistons","position":"G"},
+  "Jalen Duren":{"team":"Detroit Pistons","position":"C"},
+  "Ausar Thompson":{"team":"Detroit Pistons","position":"F"},
+  // Brooklyn Nets
+  "Cam Thomas":{"team":"Brooklyn Nets","position":"G"},
+  // Chicago Bulls
+  "Zach LaVine":{"team":"Chicago Bulls","position":"G"},
+  "Nikola Vucevic":{"team":"Chicago Bulls","position":"C"},
+  "Coby White":{"team":"Chicago Bulls","position":"G"},
+  // Phoenix Suns
+  "Devin Booker":{"team":"Phoenix Suns","position":"G"},
+  "Jusuf Nurkic":{"team":"Phoenix Suns","position":"C"},
 };
 
 async function fetchRoster() {
@@ -365,35 +472,78 @@ function extractInjuryType(text) {
 }
 
 function extractPlayer(text) {
+  // ── Step 1: Full-roster scan first (most reliable) ──────────────────────────
+  // Check roster cache against the tweet text — exact name match preferred
+  const lowerText = text.toLowerCase();
+  for (const name of Object.keys(rosterCache)) {
+    if (name.length < 5) continue; // skip too-short names
+    // Require whole-word match to avoid partial hits
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${escaped}\\b`, 'i').test(text)) return name;
+  }
+
+  // ── Step 2: Regex candidates with strict filtering ───────────────────────────
+  // These words commonly appear capitalized mid-tweet but are NOT player names
+  const skipStart = /^(The|This|He|She|They|We|His|Her|Their|Per|Via|From|With|For|Breaking|Sources|Report|Update|According|It|In|At|No\.|No,|NBA|League|Official|Team|Head|Sources:|UPDATE|BREAKING|Just|Out|Game|Tonight|Today|Now|Here|After|Before|During|Without|Against|Between|All|Both|Neither|Each|Every|Some|Any|More|Most|Less|Few|Several|Many|Such|Other|Same|Next|Last|Another|One|Two|Three|First|Second|Third)/i;
+
+  // Valid NBA first names — helps filter garbage
+  const knownFirstNames = new Set([
+    'LeBron','Luka','Anthony','Kevin','Stephen','Steph','Giannis','Jayson','Shai','Damian',
+    'Joel','Nikola','Karl','Bam','Kawhi','Paul','Jimmy','Donovan','Victor','Tyrese',
+    'Scottie','Paolo','Chet','Zion','Ja','Devin','Trae','Jaylen','Jalen','Darius','Evan',
+    'Jamal','Michael','Aaron','Andrew','Draymond','Rudy','Julius','Julius','Jaden','Alex',
+    'Isaiah','Alperen','Fred','Amen','Kelly','Khris','Brook','Bobby','Tyler','Terry',
+    'Miles','Myles','Pascal','Bennedict','RJ','Immanuel','Jakob','Franz','Wendell',
+    'Brandon','Dejounte','CJ','Herb','Jonas','Trey','Josh','Karl','Ian','Mikal','OG',
+    'Donovan','De\'Aaron','Domantas','DeMar','Keegan','Jeff','Tom','Andy','Eric','Scott',
+    'Scoot','Anfernee','Jerami','Deandre','Deni','Lauri','Jaren','Collin','Walker',
+    'Cooper','Klay','Kyrie','Marcus','Austin','Rui','Cam','Cade','Ausar','Zach','Coby',
+    'LaMelo','Jalen','James','Kristaps','Al','Payton','Max','Jonathan','Luguentz',
+    'De\'Andre','Clint','De\'Aaron','Dyson','Herb','Trey','Jordan','Malcolm',
+  ]);
+
   const patterns = [
-    /^([A-Z][a-záàâäãéèêëíìîïóòôöõúùûüñç'.-]+(?:\s+[A-Z][a-záàâäãéèêëíìîïóòôöõúùûüñç'.-]+){1,3})\s*\(/,
-    /^([A-Z][a-záàâäãéèêëíìîïóòôöõúùûüñç'.-]+(?:\s+[A-Z][a-záàâäãéèêëíìîïóòôöõúùûüñç'.-]+){1,3})\s+(?:is|will|won'?t|has|was|did)\b/,
-    /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,3})\s+(?:ruled out|out tonight|is questionable|is doubtful|is probable|listed as|will not play|won'?t play)/i,
-    /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,3})\s+(?:–|—|-)\s+(?:ankle|knee|quad|hamstring|achilles|back|shoulder|hip|calf|wrist)/i,
+    // "PlayerName (body part)" at start of tweet
+    /^([A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+(?:\s+[A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+){1,2})\s*\(/,
+    // "PlayerName is/will/won't/has/was" at start
+    /^([A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+(?:\s+[A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+){1,2})\s+(?:is|will|won'?t|has|was|did)\b/,
+    // "PlayerName ruled out / questionable / doubtful / listed as" anywhere
+    /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,2})\s+(?:ruled out|out tonight|is questionable|is doubtful|is probable|listed as|will not play|won'?t play|has been ruled)/i,
+    // "PlayerName — ankle/knee/etc" injury dash pattern
+    /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,2})\s+(?:–|—|-)\s+(?:ankle|knee|quad|hamstring|achilles|back|shoulder|hip|calf|wrist|hand|foot)/i,
   ];
-  const skipWords = /^(The|This|He|She|They|We|His|Her|Per|Via|From|With|For|Breaking|Sources|Report|Update|According)/i;
 
   const candidates = [];
   for (const p of patterns) {
     const m = text.match(p);
-    if (m?.[1] && m[1].length > 3 && !skipWords.test(m[1])) {
-      candidates.push(m[1].trim());
-    }
+    if (!m?.[1]) continue;
+    const name = m[1].trim();
+    const parts = name.split(' ');
+    // Must be 2+ words, each 2+ chars, first name must be known or be plausible
+    if (parts.length < 2) continue;
+    if (parts.some(w => w.length < 2)) continue;
+    if (skipStart.test(name)) continue;
+    // First word must be a plausible first name (in known set OR title-cased 4+ char word)
+    if (!knownFirstNames.has(parts[0]) && parts[0].length < 4) continue;
+    // Reject if any word is a common non-name word
+    const nonNameWords = /^(no|not|out|the|and|but|just|also|only|even|then|than|when|that|this|they|them|their|about|after|before|during|tonight|tonight|game|team|will|wont|was|per|via|for|from|with)\b/i;
+    if (parts.some(w => nonNameWords.test(w))) continue;
+    candidates.push(name);
   }
 
-  // Prefer a candidate that is a known active player
+  // Prefer roster-verified candidate
   for (const name of candidates) {
     if (isKnownPlayer(name)) return name;
   }
 
-  // Also scan the full roster for a name mentioned anywhere in the tweet
-  const lowerText = text.toLowerCase();
-  for (const name of Object.keys(rosterCache)) {
-    if (lowerText.includes(name.toLowerCase())) return name;
+  // Return best unverified candidate only if it passes basic plausibility
+  const best = candidates[0];
+  if (best) {
+    const firstWord = best.split(' ')[0];
+    if (knownFirstNames.has(firstWord)) return best;
   }
 
-  // Last resort: return best regex candidate even if not in roster
-  return candidates[0] || null;
+  return null; // Return null rather than bad garbage — skipped reports are better than wrong ones
 }
 
 function calcConfidence(reporter, status, tweetText, corrobCount = 0) {
@@ -441,14 +591,15 @@ async function saveReport(r) {
       INSERT INTO injury_reports
         (tweet_id, player, position, team, status, injury_type, body_part,
          matchup, game_date, game_time, reporter, outlet, tier, confidence,
-         time_of_report, prev_status, days_since_last_report, tweet_text, corroborators)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         time_of_report, prev_status, days_since_last_report, tweet_text, corroborators, corrob_tweets)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
       ON CONFLICT (tweet_id) DO NOTHING
     `, [
       r.tweet_id, r.player, r.position, r.team, r.status, r.injury_type, r.body_part,
       r.matchup, r.game_date, r.game_time, r.reporter, r.outlet, r.tier, r.confidence,
       r.time_of_report, r.prev_status, r.days_since_last_report, r.tweet_text,
       r.corroborators || [],
+      JSON.stringify(r.corrobTweets || []),
     ]);
   } catch (err) {
     console.error('[DB] Save error:', err.message);
@@ -563,6 +714,7 @@ async function poll() {
       days_since_last_report,
       tweet_text:  tweet.text,
       corroborators: [],
+      corrobTweets: [],
       // for dashboard compat
       handle:      '@' + reporter.handle,
       injury:      `${injury_type !== 'Undisclosed' ? injury_type + ' — ' : ''}${body_part}`,
@@ -570,6 +722,40 @@ async function poll() {
       timestamp:   tweetTime.toISOString(),
       tweetId:     tweet.id,
     };
+
+    // ── Grouping: same player + same status within 3 hours → merge as corroboration
+    const THREE_HOURS = 3 * 60 * 60 * 1000;
+    const existing = injuryCache.find(r =>
+      r.player && player &&
+      r.player.toLowerCase() === player.toLowerCase() &&
+      r.status === status &&
+      Math.abs(new Date(r.time_of_report).getTime() - tweetTime.getTime()) < THREE_HOURS
+    );
+
+    if (existing) {
+      // Add as corroborator on the existing report instead of creating a new one
+      if (!existing.corroborators.includes(reporter.name)) {
+        existing.corroborators.push(reporter.name);
+        existing.corrobTweets = existing.corrobTweets || [];
+        existing.corrobTweets.push({
+          reporter: reporter.name,
+          handle:   '@' + reporter.handle,
+          tweet:    tweet.text,
+          tweetId:  tweet.id,
+          outlet:   reporter.outlet,
+          tier:     reporter.tier,
+        });
+        // Boost confidence slightly for corroboration
+        existing.confidence = Math.min(existing.confidence + 3, 99);
+        // Update DB record
+        await pool?.query(
+          `UPDATE injury_reports SET corroborators = $1, confidence = $2 WHERE tweet_id = $3`,
+          [existing.corroborators, existing.confidence, existing.tweet_id]
+        );
+      }
+      console.log(`  [Grouped] ${reporter.name} → ${player} (${status})`);
+      continue;
+    }
 
     injuryCache.unshift(report);
     await saveReport(report);
@@ -677,6 +863,7 @@ async function start() {
       body: r.body_part,
       timestamp: r.time_of_report,
       tweetId: r.tweet_id,
+      corrobTweets: r.corrob_tweets || [],
     });
     if (r.tweet_id) seenTweetIds.add(r.tweet_id);
   });
