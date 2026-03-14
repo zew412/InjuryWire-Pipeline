@@ -59,6 +59,10 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_time     ON injury_reports(time_of_report DESC);
       CREATE INDEX IF NOT EXISTS idx_tweet_id ON injury_reports(tweet_id);
     `);
+    await pool.query(`
+      ALTER TABLE injury_reports
+      ADD COLUMN IF NOT EXISTS corrob_tweets JSONB DEFAULT '[]'
+    `);
     console.log('[DB] Schema ready ✓');
   } catch (err) {
     console.error('[DB] Init error:', err.message);
