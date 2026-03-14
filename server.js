@@ -311,8 +311,9 @@ function isKnownPlayer(name) {
 }
 
 // ─── NBA SCHEDULE CACHE ───────────────────────────────────────────────────────
-// Maps team name → { matchup, game_date, game_time }
-let scheduleCache = {};
+// Maps team name → array of { matchup, game_date, game_time, game_datetime_utc }
+// Sorted ascending by game_date. We keep all games for the next 5 days.
+let scheduleCache = {};   // { "Los Angeles Lakers": [ {matchup, game_date, game_time, game_datetime_utc}, ... ] }
 let scheduleFetchedAt = null;
 
 async function fetchSchedule() {
@@ -323,14 +324,15 @@ async function fetchSchedule() {
   if (scheduleFetchedAt && (Date.now() - scheduleFetchedAt) < 3600000) return;
 
   try {
-    const today = new Date().toISOString().split('T')[0];
-    // Look at today + next 2 days to catch games currently being reported on
-    const dates = [0, 1, 2].map(d => {
-      const dt = new Date(); dt.setDate(dt.getDate() + d);
+    // Fetch today + next 4 days to have full visibility
+    const dates = [0, 1, 2, 3, 4].map(d => {
+      const dt = new Date();
+      dt.setDate(dt.getDate() + d);
       return dt.toISOString().split('T')[0];
     });
 
-    const all = {};
+    const allGames = {}; // team → [games]
+
     for (const date of dates) {
       const res = await axios.get('https://api.balldontlie.io/v1/games', {
         headers: { 'Authorization': BDLKEY },
@@ -338,35 +340,119 @@ async function fetchSchedule() {
         timeout: 8000,
       });
       const games = res.data?.data || [];
+
       for (const g of games) {
         const home = g.home_team?.full_name;
         const away = g.visitor_team?.full_name;
         if (!home || !away) continue;
+
         const matchup = `${away} @ ${home}`;
-        // Parse game time — balldontlie returns UTC ISO string
+
+        // Parse game_time — balldontlie gives UTC ISO datetime in g.date or g.status
         let game_time = null;
-        if (g.status && g.status.includes(':')) {
-          // "7:30 pm ET" style or ISO
+        let game_datetime_utc = null;
+
+        if (g.status && /\d:\d\d/.test(g.status)) {
+          // Already formatted like "7:30 pm ET"
           game_time = g.status;
         } else if (g.date) {
           const d = new Date(g.date);
-          game_time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' }) + ' ET';
+          game_datetime_utc = d.toISOString();
+          game_time = d.toLocaleTimeString('en-US', {
+            hour: 'numeric', minute: '2-digit', hour12: true,
+            timeZone: 'America/New_York'
+          }) + ' ET';
         }
-        const entry = { matchup, game_date: date, game_time };
-        all[home] = entry;
-        all[away] = entry;
+
+        const entry = { matchup, game_date: date, game_time, game_datetime_utc };
+
+        [home, away].forEach(team => {
+          if (!allGames[team]) allGames[team] = [];
+          // Avoid duplicate dates
+          if (!allGames[team].find(e => e.game_date === date)) {
+            allGames[team].push(entry);
+          }
+        });
       }
     }
-    scheduleCache = all;
+
+    // Sort each team's games chronologically
+    for (const team of Object.keys(allGames)) {
+      allGames[team].sort((a, b) => a.game_date.localeCompare(b.game_date));
+    }
+
+    scheduleCache = allGames;
     scheduleFetchedAt = Date.now();
-    console.log(`[Schedule] Cached ${Object.keys(all).length / 2} games`);
+
+    const totalGames = Object.values(allGames).reduce((sum, arr) => sum + arr.length, 0) / 2;
+    console.log(`[Schedule] Cached ${totalGames} games across ${dates.length} days`);
   } catch (err) {
     console.warn('[Schedule] Fetch failed:', err.message);
   }
 }
 
-function getGameInfo(team) {
-  return scheduleCache[team] || { matchup: null, game_date: null, game_time: null };
+/**
+ * getGameInfo — returns the correct game entry for a team given tweet context.
+ *
+ * Logic:
+ *  1. If tweet says "tonight" / "out tonight" / "tonight's game" → use today's game only
+ *  2. If tweet says "tomorrow" → use tomorrow's game
+ *  3. If no temporal hint: use the next upcoming game after tweet time
+ *     (i.e. the earliest game that hasn't already ended)
+ *  4. Never assign a game that was played >6 hours before the tweet
+ */
+function getGameInfo(team, tweetText = '', tweetTime = null) {
+  const games = scheduleCache[team];
+  if (!games || games.length === 0) return { matchup: null, game_date: null, game_time: null };
+
+  const tw = (tweetText || '').toLowerCase();
+  const now = tweetTime ? new Date(tweetTime) : new Date();
+
+  // ET midnight offset — games don't start before noon ET typically
+  const todayET = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const todayDateStr = `${todayET.getFullYear()}-${String(todayET.getMonth()+1).padStart(2,'0')}-${String(todayET.getDate()).padStart(2,'0')}`;
+  const tomorrowDate = new Date(todayET);
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const tomorrowDateStr = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth()+1).padStart(2,'0')}-${String(tomorrowDate.getDate()).padStart(2,'0')}`;
+
+  // ── Explicit temporal signals in tweet ───────────────────────────────────────
+  const mentionsTonight  = /tonight|out tonight|tonight's game|tonight's matchup|today/.test(tw);
+  const mentionsTomorrow = /tomorrow|tomorrow's game/.test(tw);
+
+  if (mentionsTonight) {
+    // Must be today's game
+    const todayGame = games.find(g => g.game_date === todayDateStr);
+    if (todayGame) return todayGame;
+    // No game today — reporter may have tweeted just after midnight ET; try yesterday
+    // (don't fallback to a future game for "tonight" language)
+    return { matchup: null, game_date: null, game_time: null };
+  }
+
+  if (mentionsTomorrow) {
+    const tomorrowGame = games.find(g => g.game_date === tomorrowDateStr);
+    if (tomorrowGame) return tomorrowGame;
+    return { matchup: null, game_date: null, game_time: null };
+  }
+
+  // ── No explicit temporal hint — use the next upcoming game ───────────────────
+  // Find the earliest game that either starts in the future OR started within
+  // the last 3 hours (game is still plausibly ongoing / relevant)
+  const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+
+  for (const g of games) {
+    if (g.game_datetime_utc) {
+      const gameStart = new Date(g.game_datetime_utc);
+      const diff = gameStart.getTime() - now.getTime();
+      // Game hasn't started yet, or started within last 3 hours
+      if (diff > -THREE_HOURS_MS) return g;
+    } else {
+      // No UTC time available — fall back to date comparison
+      if (g.game_date >= todayDateStr) return g;
+    }
+  }
+
+  // All games in cache are in the past — return the most recent one as best guess
+  return games[games.length - 1];
 }
 
 // ─── REPORTERS ────────────────────────────────────────────────────────────────
@@ -644,91 +730,199 @@ function extractInjuryType(text) {
 }
 
 function extractPlayer(text) {
-  // ── Step 1: Full-roster scan first (most reliable) ──────────────────────────
-  // Check roster cache against the tweet text — exact name match preferred
-  const lowerText = text.toLowerCase();
-  for (const name of Object.keys(rosterCache)) {
-    if (name.length < 5) continue; // skip too-short names
-    // Require whole-word match to avoid partial hits
+  // Build a combined lookup: ROSTER_FALLBACK is always available immediately on startup.
+  // rosterCache is populated once balldontlie loads. Use both.
+  const combined = { ...ROSTER_FALLBACK, ...rosterCache };
+
+  // ── Step 1: Direct roster scan — whole-word match against all known players ──
+  // This is the most reliable method. If we find a match, use it immediately.
+  for (const name of Object.keys(combined)) {
+    if (name.length < 5) continue;
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     if (new RegExp(`\\b${escaped}\\b`, 'i').test(text)) return name;
   }
 
-  // ── Step 2: Regex candidates with strict filtering ───────────────────────────
-  // These words commonly appear capitalized mid-tweet but are NOT player names
-  const skipStart = /^(The|This|He|She|They|We|His|Her|Their|Per|Via|From|With|For|Breaking|Sources|Report|Update|According|It|In|At|No\.|No,|NBA|League|Official|Team|Head|Sources:|UPDATE|BREAKING|Just|Out|Game|Tonight|Today|Now|Here|After|Before|During|Without|Against|Between|All|Both|Neither|Each|Every|Some|Any|More|Most|Less|Few|Several|Many|Such|Other|Same|Next|Last|Another|One|Two|Three|First|Second|Third)/i;
-
-  // Valid NBA first names — helps filter garbage
-  const knownFirstNames = new Set([
-    'LeBron','Luka','Anthony','Kevin','Stephen','Steph','Giannis','Jayson','Shai','Damian',
-    'Joel','Nikola','Karl','Bam','Kawhi','Paul','Jimmy','Donovan','Victor','Tyrese',
-    'Scottie','Paolo','Chet','Zion','Ja','Devin','Trae','Jaylen','Jalen','Darius','Evan',
-    'Jamal','Michael','Aaron','Andrew','Draymond','Rudy','Julius','Julius','Jaden','Alex',
-    'Isaiah','Alperen','Fred','Amen','Kelly','Khris','Brook','Bobby','Tyler','Terry',
-    'Miles','Myles','Pascal','Bennedict','RJ','Immanuel','Jakob','Franz','Wendell',
-    'Brandon','Dejounte','CJ','Herb','Jonas','Trey','Josh','Karl','Ian','Mikal','OG',
-    'Donovan','De\'Aaron','Domantas','DeMar','Keegan','Jeff','Tom','Andy','Eric','Scott',
-    'Scoot','Anfernee','Jerami','Deandre','Deni','Lauri','Jaren','Collin','Walker',
-    'Cooper','Klay','Kyrie','Marcus','Austin','Rui','Cam','Cade','Ausar','Zach','Coby',
-    'LaMelo','Jalen','James','Kristaps','Al','Payton','Max','Jonathan','Luguentz',
-    'De\'Andre','Clint','De\'Aaron','Dyson','Herb','Trey','Jordan','Malcolm',
-  ]);
+  // ── Step 2: Regex extraction — ONLY accepted if it matches a known player ────
+  // We use regex to find candidate names, but REJECT any result not in the roster.
+  // This prevents garbage like "No. Just", "He Will", "Out Tonight" from appearing.
+  const skipStart = /^(The|This|He|She|They|We|His|Her|Their|Per|Via|From|With|For|Breaking|Sources|Report|Update|According|It|In|At|No\b|NBA|League|Official|Team|Head|UPDATE|BREAKING|Just|Out|Game|Tonight|Today|Now|Here|After|Before|During|Without|Against|Between|All|Both|Neither|Each|Every|Some|Any|More|Most|Less|Few|Several|Many|Such|Other|Same|Next|Last|Another|One|Two|Three|First|Second|Third)/i;
 
   const patterns = [
-    // "PlayerName (body part)" at start of tweet
     /^([A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+(?:\s+[A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+){1,2})\s*\(/,
-    // "PlayerName is/will/won't/has/was" at start
     /^([A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+(?:\s+[A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.-]+){1,2})\s+(?:is|will|won'?t|has|was|did)\b/,
-    // "PlayerName ruled out / questionable / doubtful / listed as" anywhere
     /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,2})\s+(?:ruled out|out tonight|is questionable|is doubtful|is probable|listed as|will not play|won'?t play|has been ruled)/i,
-    // "PlayerName — ankle/knee/etc" injury dash pattern
     /([A-Z][a-z'.-]+(?:\s+[A-Z][a-z'.-]+){1,2})\s+(?:–|—|-)\s+(?:ankle|knee|quad|hamstring|achilles|back|shoulder|hip|calf|wrist|hand|foot)/i,
   ];
 
-  const candidates = [];
   for (const p of patterns) {
     const m = text.match(p);
     if (!m?.[1]) continue;
     const name = m[1].trim();
-    const parts = name.split(' ');
-    // Must be 2+ words, each 2+ chars, first name must be known or be plausible
-    if (parts.length < 2) continue;
-    if (parts.some(w => w.length < 2)) continue;
     if (skipStart.test(name)) continue;
-    // First word must be a plausible first name (in known set OR title-cased 4+ char word)
-    if (!knownFirstNames.has(parts[0]) && parts[0].length < 4) continue;
-    // Reject if any word is a common non-name word
-    const nonNameWords = /^(no|not|out|the|and|but|just|also|only|even|then|than|when|that|this|they|them|their|about|after|before|during|tonight|tonight|game|team|will|wont|was|per|via|for|from|with)\b/i;
-    if (parts.some(w => nonNameWords.test(w))) continue;
-    candidates.push(name);
-  }
+    const parts = name.split(' ');
+    if (parts.length < 2) continue;
 
-  // Prefer roster-verified candidate
-  for (const name of candidates) {
+    // Strict: only accept if this name exists in our roster
     if (isKnownPlayer(name)) return name;
+
+    // Also try normalizing accents and checking again
+    const normalized = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (isKnownPlayer(normalized)) return normalized;
   }
 
-  // Return best unverified candidate only if it passes basic plausibility
-  const best = candidates[0];
-  if (best) {
-    const firstWord = best.split(' ')[0];
-    if (knownFirstNames.has(firstWord)) return best;
-  }
-
-  return null; // Return null rather than bad garbage — skipped reports are better than wrong ones
+  // If we reach here, we couldn't find a verified player — return null.
+  // A skipped report is always better than a wrong player name.
+  return null;
 }
 
-function calcConfidence(reporter, status, tweetText, corrobCount = 0) {
-  const tierPts   = reporter.tier === 1 ? 35 : reporter.tier === 2 ? 22 : 10;
-  const outletPts = ['ESPN','The Athletic','AP','Associated Press','Reuters','USA Today']
-    .some(o => (reporter.outlet||'').includes(o)) ? 20 : reporter.tier === 1 ? 15 : 10;
-  const statusMap = { Out: 0.95, Doubtful: 0.8, 'Game-Time Decision': 0.65, Questionable: 0.5, Probable: 0.35 };
-  const sw = statusMap[status] || 0.5;
-  const statusPts = sw >= 0.9 ? 18 : sw >= 0.75 ? 14 : sw >= 0.55 ? 10 : 6;
-  const langPts   = tweetText ? Math.min(15, Math.round((tweetText.length / 260) * 15)) : 8;
-  const signalPts = reporter.signal === 'High' ? 8 : 4;
-  const corrPts   = Math.min(corrobCount * 3, 9);
-  return Math.min(tierPts + outletPts + statusPts + langPts + signalPts + corrPts, 99);
+/**
+ * calcConfidence — returns a score 0–99 (integer)
+ *
+ * Eight distinct factors, each independently weighted and reasoned:
+ *
+ *  1. Reporter tier        (0–30)  Primary source credibility
+ *  2. Outlet credibility   (0–15)  Publication strength
+ *  3. Status severity      (0–15)  How definitive is the designation
+ *  4. Language precision   (0–12)  Specificity of tweet wording
+ *  5. Injury specificity   (0–8)   Named body part vs undisclosed
+ *  6. Injury type          (0–5)   Structural vs load management vs unknown
+ *  7. Corroboration        (0–10)  Independent reporters confirming
+ *  8. Recency context      (0–4)   Prior reports for this player (pattern)
+ *
+ * Max possible: 99. Hard-capped there.
+ */
+function calcConfidence(reporter, status, tweetText = '', corrobCount = 0, opts = {}) {
+  const tw = (tweetText || '').toLowerCase();
+
+  // ── 1. Reporter tier (0–30) ──────────────────────────────────────────────────
+  // Tier 1 = primary beat writers with direct locker room access
+  // Tier 2 = secondary beat, national contributors
+  // Tier 3 = digital/aggregator, limited access
+  const tierPts = reporter.tier === 1 ? 30 : reporter.tier === 2 ? 19 : 8;
+
+  // ── 2. Outlet credibility (0–15) ─────────────────────────────────────────────
+  // Weighted by editorial standards, not follower count
+  const outlet = (reporter.outlet || '').toLowerCase();
+  let outletPts = 8; // baseline
+  if (/\bespn\b/.test(outlet))                             outletPts = 15;
+  else if (/the athletic/.test(outlet))                    outletPts = 15;
+  else if (/\bap\b|associated press/.test(outlet))         outletPts = 14;
+  else if (/nba\.com|pelicans\.com|blazers\.com|team site/.test(outlet)) outletPts = 13;
+  else if (/bleacher|yahoo sports|si\.com/.test(outlet))  outletPts = 11;
+  else if (/herald|chronicle|times|globe|post|inquirer|tribune|sentinel|star|bee|plain dealer|morning news/.test(outlet)) outletPts = 12;
+  else if (/sportsnet|tsn|nbc sports|bally|spectrum/.test(outlet)) outletPts = 11;
+  else if (/clutchpoints|dnvr|the ringer|substack|independent/.test(outlet)) outletPts = 9;
+
+  // ── 3. Status severity (0–15) ────────────────────────────────────────────────
+  // "Out" is the most actionable and definitive — score it highest
+  const statusPts = {
+    'Out':                 15,
+    'Doubtful':            12,
+    'Game-Time Decision':  10,
+    'Questionable':         8,
+    'Probable':             5,
+  }[status] ?? 7;
+
+  // ── 4. Language precision (0–12) ─────────────────────────────────────────────
+  // Specific authoritative language → higher score
+  let langPts = 4; // baseline: vague tweet
+  if (/ruled out|will not play|won'?t play|is out\b|out tonight|not playing|scratched|\bdnp\b/.test(tw)) langPts = 12;
+  else if (/doubtful|highly unlikely/.test(tw))               langPts = 10;
+  else if (/game.time decision|\bgtd\b/.test(tw))             langPts = 9;
+  else if (/questionable/.test(tw))                           langPts = 8;
+  else if (/probable|expected to play|trending/.test(tw))     langPts = 6;
+  else if (/limited|did not practice|sat out|missed/.test(tw)) langPts = 7;
+  // Official language boosts precision
+  if (/official injury report|listed as|on the injury report/.test(tw)) langPts = Math.min(12, langPts + 2);
+  // First-person sourcing ("I'm told", "sources say", confirmed) boosts
+  if (/i'?m told|sources say|has confirmed|confirmed:|breaking:/.test(tw)) langPts = Math.min(12, langPts + 1);
+
+  // ── 5. Injury specificity (0–8) ──────────────────────────────────────────────
+  // Named + specific body part > general body area > undisclosed
+  let injPts = 0;
+  if (/\(ankle\)|\(knee\)|\(hamstring\)|\(achilles\)|\(back\)|\(shoulder\)|\(hip\)|\(quad\)|\(calf\)|\(wrist\)|\(hand\)|\(foot\)/.test(tw)) {
+    injPts = 8; // parenthetical format = official injury report language
+  } else if (/ankle|knee|hamstring|achilles|shoulder|hip|quad|calf|wrist|hand|foot|elbow|groin|shin|toe|finger|neck|concussion/.test(tw)) {
+    injPts = 6; // named body part
+  } else if (/back|illness|personal/.test(tw)) {
+    injPts = 4; // broad category
+  } else if (/undisclosed|injury/.test(tw)) {
+    injPts = 2; // known injured, undisclosed reason
+  }
+
+  // ── 6. Injury type context (0–5) ─────────────────────────────────────────────
+  // Structural injuries are more credible/serious when reported
+  // Load management is deliberate and usually confirmed
+  let injTypePts = 2; // baseline
+  if (/acl|mcl|achilles|fracture|broken|torn/.test(tw))           injTypePts = 5; // serious structural
+  else if (/load management|rest|planned/.test(tw))                injTypePts = 5; // deliberate — near-certain
+  else if (/sprain|strain|tendon|concussion/.test(tw))            injTypePts = 4;
+  else if (/soreness|sore|tightness|tight/.test(tw))              injTypePts = 3;
+  else if (/illness|sick|personal/.test(tw))                      injTypePts = 3;
+
+  // ── 7. Corroboration (0–10) ──────────────────────────────────────────────────
+  // Each independent reporter adds weight, diminishing returns after 3
+  const corrPts = corrobCount === 0 ? 0
+    : corrobCount === 1 ? 5
+    : corrobCount === 2 ? 8
+    : 10;
+
+  // ── 8. Recency/pattern context (0–4) ─────────────────────────────────────────
+  // If this player has a recent injury history, the report is more credible
+  // opts.daysSinceLastReport: null = no history, 0 = same day, 1-3 = recent, etc.
+  let recencyPts = 0;
+  const days = opts.daysSinceLastReport;
+  if (days === 0)                    recencyPts = 4; // same-day repeat = very credible
+  else if (days !== null && days <= 3) recencyPts = 3; // recent pattern
+  else if (days !== null && days <= 7) recencyPts = 2; // known injury history
+  else if (days !== null && days <= 14) recencyPts = 1; // older history
+
+  const total = tierPts + outletPts + statusPts + langPts + injPts + injTypePts + corrPts + recencyPts;
+  return Math.min(total, 99);
+}
+
+/**
+ * Returns a breakdown object for frontend display
+ */
+function confBreakdownServer(reporter, status, tweetText = '', corrobCount = 0, opts = {}) {
+  const tw = (tweetText || '').toLowerCase();
+  const outlet = (reporter.outlet || '').toLowerCase();
+
+  const tier    = reporter.tier === 1 ? 30 : reporter.tier === 2 ? 19 : 8;
+  let outletPts = 8;
+  if (/\bespn\b|the athletic/.test(outlet)) outletPts = 15;
+  else if (/\bap\b|associated press/.test(outlet)) outletPts = 14;
+  else if (/herald|chronicle|times|globe|post|inquirer|tribune|sentinel|star|bee|plain dealer/.test(outlet)) outletPts = 12;
+  else if (/sportsnet|tsn|nbc sports|bally|spectrum/.test(outlet)) outletPts = 11;
+
+  const statusPts = {Out:15,Doubtful:12,'Game-Time Decision':10,Questionable:8,Probable:5}[status] ?? 7;
+
+  let langPts = 4;
+  if (/ruled out|will not play|won'?t play|is out\b|out tonight/.test(tw)) langPts = 12;
+  else if (/doubtful/.test(tw)) langPts = 10;
+  else if (/game.time|\bgtd\b/.test(tw)) langPts = 9;
+  else if (/questionable/.test(tw)) langPts = 8;
+  else if (/limited|did not practice/.test(tw)) langPts = 7;
+  else if (/probable/.test(tw)) langPts = 6;
+
+  let injPts = 0;
+  if (/\((ankle|knee|hamstring|achilles|back|shoulder|hip|quad|calf|wrist|hand|foot)\)/.test(tw)) injPts = 8;
+  else if (/ankle|knee|hamstring|achilles|shoulder|hip|quad|calf|wrist|hand|foot|elbow|groin|concussion/.test(tw)) injPts = 6;
+  else if (/back|illness|personal/.test(tw)) injPts = 4;
+  else if (/undisclosed|injury/.test(tw)) injPts = 2;
+
+  let injTypePts = 2;
+  if (/acl|mcl|achilles|fracture|broken|torn/.test(tw)) injTypePts = 5;
+  else if (/load management|rest|planned/.test(tw)) injTypePts = 5;
+  else if (/sprain|strain|tendon|concussion/.test(tw)) injTypePts = 4;
+  else if (/soreness|tightness/.test(tw)) injTypePts = 3;
+
+  const corrPts = corrobCount === 0 ? 0 : corrobCount === 1 ? 5 : corrobCount === 2 ? 8 : 10;
+
+  const days = opts.daysSinceLastReport;
+  const recencyPts = days === 0 ? 4 : days !== null && days <= 3 ? 3 : days !== null && days <= 7 ? 2 : days !== null && days <= 14 ? 1 : 0;
+
+  return { tier, outlet: outletPts, status: statusPts, lang: langPts, injury: injPts, injType: injTypePts, corr: corrPts, recency: recencyPts };
 }
 
 // ─── DB HELPERS ───────────────────────────────────────────────────────────────
@@ -856,8 +1050,8 @@ async function poll() {
     const team      = rosterEntry?.team
       || (reporter.team === 'All Teams' ? 'Unknown' : reporter.team);
 
-    const confidence = calcConfidence(reporter, status, tweet.text);
-    const gameInfo  = getGameInfo(team);
+    const confidence = calcConfidence(reporter, status, tweet.text, 0, { daysSinceLastReport: days_since_last_report });
+    const gameInfo  = getGameInfo(team, tweet.text, tweetTime);
     const tweetTime = tweet.created_at ? new Date(tweet.created_at) : new Date();
 
     // Look up history for this player
@@ -895,17 +1089,29 @@ async function poll() {
       tweetId:     tweet.id,
     };
 
-    // ── Grouping: same player + same status within 3 hours → merge as corroboration
-    const THREE_HOURS = 3 * 60 * 60 * 1000;
+    // ── Corroboration: same player + same game + compatible status → group tweets ─
+    // "Compatible status" means we don't group an "Out" with a "Questionable" —
+    // those are different reports about different designations.
+    // We allow grouping across minor status variants (e.g. two reporters both say Out).
+    // Window: 6 hours — gives time for multiple reporters to pick up the same story.
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+
+    const statusGroup = s => {
+      if (s === 'Out' || s === 'Doubtful') return 'out-doubtful';
+      if (s === 'Game-Time Decision') return 'gtd';
+      if (s === 'Questionable') return 'questionable';
+      return 'probable';
+    };
+
     const existing = injuryCache.find(r =>
       r.player && player &&
       r.player.toLowerCase() === player.toLowerCase() &&
-      r.status === status &&
-      Math.abs(new Date(r.time_of_report).getTime() - tweetTime.getTime()) < THREE_HOURS
+      statusGroup(r.status) === statusGroup(status) &&
+      r.game_date === gameInfo.game_date &&  // must be for the same game
+      Math.abs(new Date(r.time_of_report).getTime() - tweetTime.getTime()) < SIX_HOURS
     );
 
     if (existing) {
-      // Add as corroborator on the existing report instead of creating a new one
       if (!existing.corroborators.includes(reporter.name)) {
         existing.corroborators.push(reporter.name);
         existing.corrobTweets = existing.corrobTweets || [];
@@ -916,18 +1122,50 @@ async function poll() {
           tweetId:  tweet.id,
           outlet:   reporter.outlet,
           tier:     reporter.tier,
+          timestamp: tweetTime.toISOString(),
         });
-        // Boost confidence slightly for corroboration
-        existing.confidence = Math.min(existing.confidence + 3, 99);
-        // Update DB record
-        await pool?.query(
-          `UPDATE injury_reports SET corroborators = $1, confidence = $2 WHERE tweet_id = $3`,
-          [existing.corroborators, existing.confidence, existing.tweet_id]
+        seenTweetIds.add(tweet.id); // also mark as seen so it's never reprocessed
+
+        // Recalculate confidence with new corroboration count
+        const existingReporter = REPORTERS.find(r => r.name === existing.reporter)
+          || { tier: existing.tier || 2, signal: 'Medium', outlet: existing.outlet || '' };
+        existing.confidence = calcConfidence(
+          existingReporter, existing.status, existing.tweet_text,
+          existing.corroborators.length,
+          { daysSinceLastReport: existing.days_since_last_report }
         );
+
+        // Persist corrob_tweets + updated confidence to DB
+        await pool?.query(
+          `UPDATE injury_reports
+           SET corroborators = $1, corrob_tweets = $2, confidence = $3
+           WHERE tweet_id = $4`,
+          [
+            existing.corroborators,
+            JSON.stringify(existing.corrobTweets),
+            existing.confidence,
+            existing.tweet_id,
+          ]
+        );
+
+        console.log(`  [+Corrob] ${reporter.name} → "${player}" (${status}) | now ${existing.corroborators.length + 1} sources`);
+      } else {
+        console.log(`  [Skip dupe] ${reporter.name} already listed for ${player}`);
       }
-      console.log(`  [Grouped] ${reporter.name} → ${player} (${status})`);
       continue;
     }
+
+    // New report — include the primary tweet in corrobTweets too so the
+    // frontend always has a consistent array to render from
+    report.corrobTweets = [{
+      reporter: reporter.name,
+      handle:   '@' + reporter.handle,
+      tweet:    tweet.text,
+      tweetId:  tweet.id,
+      outlet:   reporter.outlet,
+      tier:     reporter.tier,
+      timestamp: tweetTime.toISOString(),
+    }];
 
     injuryCache.unshift(report);
     await saveReport(report);
@@ -1037,7 +1275,9 @@ async function start() {
       tweetId: r.tweet_id,
       corrobTweets: r.corrob_tweets || [],
     });
+    // Mark primary tweet and all corroborating tweets as seen
     if (r.tweet_id) seenTweetIds.add(r.tweet_id);
+    (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
   });
   console.log(`[Start] Loaded ${injuryCache.length} reports from DB`);
 
