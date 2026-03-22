@@ -1092,7 +1092,6 @@ async function poll() {
       game_date:   gameInfo.game_date,
       game_time:   gameInfo.game_time,
       in_game:     gameInfo.in_game || false,
-      reporter:    reporter.name,
       outlet:      reporter.outlet,
       tier:        reporter.tier,
       confidence,
