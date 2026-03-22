@@ -1288,16 +1288,23 @@ async function start() {
   // Load last 24h from DB into memory on startup
   const existing = await loadRecentFromDB(24);
   existing.forEach(r => {
+    // Skip reports with no player or no reporter — these are bad old records
+    if (!r.player || r.player === 'Unknown Player') return;
+    if (!r.reporter) return;
+
+    const reporterObj = REPORTERS.find(x => x.name === r.reporter);
+    const handle = reporterObj ? '@' + reporterObj.handle : (r.handle || '');
+
     injuryCache.push({
       ...r,
-      handle: r.reporter ? '@' + (REPORTERS.find(x => x.name === r.reporter)?.handle || '') : '',
-      injury: `${r.injury_type !== 'Undisclosed' ? r.injury_type + ' — ' : ''}${r.body_part}`,
+      handle,
+      injury: `${r.injury_type && r.injury_type !== 'Undisclosed' ? r.injury_type + ' — ' : ''}${r.body_part || ''}`,
       body: r.body_part,
       timestamp: r.time_of_report,
       tweetId: r.tweet_id,
       corrobTweets: r.corrob_tweets || [],
+      in_game: r.in_game || false,
     });
-    // Mark primary tweet and all corroborating tweets as seen
     if (r.tweet_id) seenTweetIds.add(r.tweet_id);
     (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
   });
