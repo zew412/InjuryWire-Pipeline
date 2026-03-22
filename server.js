@@ -1126,8 +1126,10 @@ async function poll() {
     const existing = injuryCache.find(r =>
       r.player && player &&
       r.player.toLowerCase() === player.toLowerCase() &&
+      r.team === team &&  // must be same team — prevents cross-team false matches
       statusGroup(r.status) === statusGroup(status) &&
-      r.game_date === gameInfo.game_date &&  // must be for the same game
+      r.game_date !== null && gameInfo.game_date !== null &&  // don't group on null dates
+      r.game_date === gameInfo.game_date &&
       Math.abs(new Date(r.time_of_report).getTime() - tweetTime.getTime()) < SIX_HOURS
     );
 
