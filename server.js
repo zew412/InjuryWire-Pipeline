@@ -325,8 +325,8 @@ async function fetchSchedule() {
   if (scheduleFetchedAt && (Date.now() - scheduleFetchedAt) < 3600000) return;
 
   try {
-    // 10 days covers any team's longest road trip gap
-    const dates = Array.from({ length: 10 }, (_, d) => {
+    // Fetch today + next 2 days — keeps API calls low, covers immediate reporting window
+    const dates = Array.from({ length: 3 }, (_, d) => {
       const dt = new Date();
       dt.setDate(dt.getDate() + d);
       return dt.toISOString().split('T')[0];
