@@ -325,7 +325,7 @@ async function fetchSchedule() {
   if (scheduleFetchedAt && (Date.now() - scheduleFetchedAt) < 3600000) return;
 
   try {
-    // Fetch 10 days out — covers any team's full road trip gap
+    // 10 days covers any team's longest road trip gap
     const dates = Array.from({ length: 10 }, (_, d) => {
       const dt = new Date();
       dt.setDate(dt.getDate() + d);
@@ -362,13 +362,12 @@ async function fetchSchedule() {
           }) + ' ET';
         }
 
-        // Also store balldontlie's status string so we can check if game is Final
         const entry = {
           matchup,
           game_date: date,
           game_time,
           game_datetime_utc,
-          bdl_status: g.status || null,  // e.g. "Final", "7:30 pm ET", "In Progress"
+          bdl_status: g.status || null, // "Final", "7:30 pm ET", "In Progress"
         };
 
         [home, away].forEach(team => {
@@ -394,22 +393,22 @@ async function fetchSchedule() {
   }
 }
 
+// NBA games average ~2h 15m. 2h 30m gives buffer for overtime.
+const NBA_GAME_DURATION_MS = 150 * 60 * 1000;
+
 /**
  * getGameInfo — assigns a report to the correct game.
  *
- * Priority order:
- *  1. Explicit tweet language ("tonight", "tomorrow") → that specific game
- *  2. No hint + team plays today:
- *     a. Game not yet started → today's game (pre-game report)
- *     b. Game started < NBA_GAME_DURATION ago → game is ONGOING → flag as in-game injury
- *     c. Game started > NBA_GAME_DURATION ago → game is finished → next future game
- *  3. No hint + no game today → next upcoming game (however many days out)
- *  4. No upcoming games found → null (don't guess)
- *
- * NBA games average ~2h 15m. We use 2.5h (150 min) as the "game might still be live" window.
+ * Cases:
+ *  1. Tweet says "tonight"/"today" → today's game only
+ *  2. Tweet says "tomorrow" → tomorrow's game only
+ *  3. No hint, team plays today:
+ *     - Game not started → pre-game report for today
+ *     - Game started < 2h30m ago → IN-GAME injury (flagged)
+ *     - Game finished → assign to next future game
+ *  4. No hint, no game today → next upcoming game (up to 10 days out)
+ *  5. Nothing found → null
  */
-const NBA_GAME_DURATION_MS = 150 * 60 * 1000; // 2h 30m to be safe
-
 function getGameInfo(team, tweetText = '', tweetTime = null) {
   const games = scheduleCache[team];
   if (!games || games.length === 0) {
@@ -419,16 +418,15 @@ function getGameInfo(team, tweetText = '', tweetTime = null) {
   const tw  = (tweetText || '').toLowerCase();
   const now = tweetTime ? new Date(tweetTime) : new Date();
 
-  // Compute today and tomorrow in ET
   const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const pad   = n => String(n).padStart(2, '0');
-  const toDateStr = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  const todayStr    = toDateStr(etNow);
+  const toStr = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const todayStr    = toStr(etNow);
   const tomorrowET  = new Date(etNow); tomorrowET.setDate(etNow.getDate() + 1);
-  const tomorrowStr = toDateStr(tomorrowET);
+  const tomorrowStr = toStr(tomorrowET);
 
   // ── 1. Explicit temporal signals ─────────────────────────────────────────────
-  const mentionsTonight  = /\btonight\b|out tonight|tonight's game|today\b/.test(tw);
+  const mentionsTonight  = /\btonight\b|out tonight|tonight's game|\btoday\b/.test(tw);
   const mentionsTomorrow = /\btomorrow\b|tomorrow's game/.test(tw);
 
   if (mentionsTonight) {
@@ -441,41 +439,40 @@ function getGameInfo(team, tweetText = '', tweetTime = null) {
     return g ? { ...g, in_game: false } : { matchup: null, game_date: null, game_time: null, in_game: false };
   }
 
-  // ── 2. No hint — check today's game state ────────────────────────────────────
+  // ── 2. Check today's game state ───────────────────────────────────────────────
   const todayGame = games.find(g => g.game_date === todayStr);
 
   if (todayGame) {
-    // Game already marked Final by balldontlie
     if (todayGame.bdl_status === 'Final') {
-      // Game is over — fall through to find next future game
+      // Game is over — fall through to next game
     } else if (todayGame.game_datetime_utc) {
       const gameStart = new Date(todayGame.game_datetime_utc);
       const elapsed   = now.getTime() - gameStart.getTime();
 
       if (elapsed < 0) {
-        // Game hasn't started yet — pre-game report
+        // Pre-game
         return { ...todayGame, in_game: false };
       } else if (elapsed < NBA_GAME_DURATION_MS) {
-        // Game is likely ongoing — this is an in-game injury report
-        console.log(`  [In-game] Report for ${team} during live game (${Math.round(elapsed/60000)}min elapsed)`);
+        // Game is likely live — in-game injury
+        console.log(`  [In-game] ${team} game ${Math.round(elapsed/60000)}min elapsed`);
         return { ...todayGame, in_game: true };
       }
-      // else: game has likely ended — fall through to next game
+      // Game likely over — fall through to next game
     } else {
-      // No UTC time — just use date comparison, assume today is valid
+      // No UTC time available — assume today is valid
       return { ...todayGame, in_game: false };
     }
   }
 
-  // ── 3. No game today (or today's game is over) — find next future game ───────
+  // ── 3. Find next future game ──────────────────────────────────────────────────
   for (const g of games) {
-    if (g.game_date <= todayStr) continue; // skip today and past
-    return { ...g, in_game: false };
+    if (g.game_date > todayStr) return { ...g, in_game: false };
   }
 
-  // ── 4. Nothing upcoming in cache — return null ───────────────────────────────
   return { matchup: null, game_date: null, game_time: null, in_game: false };
 }
+
+
 
 // ─── REPORTERS ────────────────────────────────────────────────────────────────
 const REPORTERS = [
@@ -1094,8 +1091,7 @@ async function poll() {
       matchup:     gameInfo.matchup,
       game_date:   gameInfo.game_date,
       game_time:   gameInfo.game_time,
-      in_game:     gameInfo.in_game || false,  // true = injury occurred during live game
-      reporter:    reporter.name,
+      in_game:     gameInfo.in_game || false,
       outlet:      reporter.outlet,
       tier:        reporter.tier,
       confidence,
