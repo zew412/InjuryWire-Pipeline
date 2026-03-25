@@ -1,6 +1,18 @@
 /**
- * nba-scraper.js — v2
+ * nba-scraper.js — v4
+ *
+ * NBA injury PDF raw text format (via pdf-parse):
+ *   Everything concatenated, no spaces.
+ *   Player names: LastName,FirstName  (comma is the unique delimiter)
+ *   Line examples:
+ *     "03/24/202607:00(ET)SAC@CHASacramentoKingsAchiuwa,PreciousOutInjury/Illness-LowerBack;Soreness"
+ *     "Clifford,NiqueOutInjury/Illness-LeftFoot;Soreness"
+ *     "Eubanks,DrewOut"
+ *     "Injury/Illness-LeftThumb;UCL"          ← reason continuation
+ *     "Repair"                                 ← reason continuation
+ *     "CharlotteHornetsConnaughton,PatOutInjury/Illness-Illness;Illness"
  */
+
 const axios  = require('axios');
 const pdf    = require('pdf-parse');
 const { Pool } = require('pg');
@@ -14,6 +26,7 @@ let lastRawText       = '';
 let officialCache     = {};
 let officialFetchedAt = null;
 
+// ── DB INIT ───────────────────────────────────────────────────────────────────
 async function initOfficialDB() {
   if (!pool) return;
   try {
@@ -41,6 +54,7 @@ async function initOfficialDB() {
   } catch (err) { console.error('[NBA Official] DB init error:', err.message); }
 }
 
+// ── URL BUILDER ───────────────────────────────────────────────────────────────
 function getCurrentPdfUrl() {
   const etStr = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   const et = new Date(etStr);
@@ -55,17 +69,19 @@ function getCurrentPdfUrl() {
   return `https://ak-static.cms.nba.com/referee/injury/Injury-Report_${year}-${month}-${day}_${String(hours).padStart(2,'0')}_${String(roundedMins).padStart(2,'0')}${ampm}.pdf`;
 }
 
+// ── STATUS ────────────────────────────────────────────────────────────────────
 function normaliseStatus(raw) {
   if (!raw) return null;
-  const s = raw.trim().toLowerCase();
-  if (s.includes('out'))                                              return 'Out';
-  if (s.includes('doubtful'))                                         return 'Doubtful';
-  if (s.includes('game time')||s.includes('game-time')||s==='gtd')   return 'Game-Time Decision';
-  if (s.includes('questionable'))                                     return 'Questionable';
-  if (s.includes('probable'))                                         return 'Probable';
-  return null;
+  switch (raw.toLowerCase()) {
+    case 'out':          return 'Out';
+    case 'doubtful':     return 'Doubtful';
+    case 'questionable': return 'Questionable';
+    case 'probable':     return 'Probable';
+    default:             return null;  // Available / Active → skip
+  }
 }
 
+// ── TEAM MAP ──────────────────────────────────────────────────────────────────
 const NBA_TEAMS = [
   'Atlanta Hawks','Boston Celtics','Brooklyn Nets','Charlotte Hornets','Chicago Bulls',
   'Cleveland Cavaliers','Dallas Mavericks','Denver Nuggets','Detroit Pistons',
@@ -75,88 +91,127 @@ const NBA_TEAMS = [
   'Oklahoma City Thunder','Orlando Magic','Philadelphia 76ers','Phoenix Suns',
   'Portland Trail Blazers','Sacramento Kings','San Antonio Spurs',
   'Toronto Raptors','Utah Jazz','Washington Wizards',
-].sort((a,b) => b.length - a.length);
+];
+// Concatenated form (no spaces) → full name, sorted longest first
+const TEAM_MAP  = {};
+for (const t of NBA_TEAMS) TEAM_MAP[t.replace(/\s+/g, '')] = t;
+const TEAM_KEYS = Object.keys(TEAM_MAP).sort((a, b) => b.length - a.length);
 
-const DATE_RE   = /\b(\d{2}\/\d{2}\/\d{4})\b/;
-const TIME_RE   = /\b(\d{1,2}:\d{2}\s*(?:AM|PM)\s*ET)\b/i;
-const STATUS_RE = /\b(Out|Doubtful|Questionable|Game.Time\s+Decision|Probable|GTD|Available|Active)\b/gi;
-
-function parseSingleLine(line) {
-  const dateMatch = line.match(DATE_RE);
-  if (!dateMatch) return null;
-
-  // Must contain a status keyword
-  const statuses = [...line.matchAll(STATUS_RE)];
-  if (!statuses.length) return null;
-
-  const currentStatus = normaliseStatus(statuses[0][0]);
-  if (!currentStatus) return null;
-
-  const timeMatch = line.match(TIME_RE);
-  const gameDate  = dateMatch[1];
-  const gameTime  = timeMatch ? timeMatch[1] : '';
-
-  // Find matchup (contains "vs.")
-  const vsMatch = line.match(/([A-Z][A-Za-z\s]+(?:vs\.?)\s*[A-Z][A-Za-z\s]+?)(?=[A-Z][a-z])/);
-  const matchup = vsMatch ? vsMatch[1].trim() : '';
-
-  // Find team
-  let teamName = '';
-  let teamEnd  = -1;
-  for (const team of NBA_TEAMS) {
-    const idx = line.indexOf(team);
-    if (idx !== -1) {
-      teamName = team;
-      teamEnd  = idx + team.length;
-      break;
-    }
-  }
-  if (!teamName) return null;
-
-  // Player = text between teamEnd and first status keyword
-  const firstStatusIdx = statuses[0].index;
-  if (firstStatusIdx <= teamEnd) return null;
-  const playerRaw = line.slice(teamEnd, firstStatusIdx).trim();
-  if (!playerRaw || playerRaw.length < 4) return null;
-  // Basic sanity: should look like a name (2+ words, mostly letters)
-  if (!/^[A-Z][a-záàâäéèêëíìîïóòôöõúùûüñç'.\s-]{3,}$/.test(playerRaw)) return null;
-
-  const previousStatus = statuses[1] ? normaliseStatus(statuses[1][0]) : null;
-
-  // Reason = everything after the last status keyword
-  const lastSt    = statuses[statuses.length - 1];
-  const reasonRaw = line.slice(lastSt.index + lastSt[0].length).trim();
-  const reason    = reasonRaw.replace(/^[-–—\s]+/, '').trim();
-
-  return { game_date: gameDate, game_time: gameTime, matchup, team: teamName,
-           player: playerRaw, current_status: currentStatus,
-           previous_status: previousStatus, reason };
+// ── REASON CLEANER ────────────────────────────────────────────────────────────
+function cleanReason(raw) {
+  if (!raw) return '';
+  return raw
+    .replace(/^Injury\/Illness-/, '')
+    .replace(/^GLeague-/, 'G-League: ')
+    .replace(/;/g, ' - ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')   // split CamelCase
+    .replace(/\s+/g, ' ')
+    .trim();
 }
+
+// Convert "MM/DD/YYYY" → "YYYY-MM-DD"
+function toIsoDate(d) {
+  const m = d && d.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  return m ? `${m[3]}-${m[1]}-${m[2]}` : null;
+}
+
+// ── PARSER ────────────────────────────────────────────────────────────────────
+// After stripping date/time/matchup/team, a player line looks like:
+//   LastName,FirstNameSTATUS[reason]
+//   e.g. "Achiuwa,PreciousOutInjury/Illness-LowerBack;Soreness"
+//        "NanceJr.,LarryOutInjury/Illness-Illness;Illness"
+//        "McCullarJr.,KevinOutGLeague-Two-Way"
+//
+// Regex captures: (LastName,)(FirstName)(Status)(rest)
+const PLAYER_RE = /^([A-Z][A-Za-z'.]*(?:Jr\.|Sr\.|II|III|IV)?,)([A-Z][A-Za-z'.]*)(Out|Doubtful|Questionable|Probable|Available)(.*)/;
+
+// Lines that are page/section headers — reset context, skip
+const SKIP_RE = /^InjuryReport:|^Page\d+of|^GameDate/;
 
 function parseInjuryText(text) {
   if (!text) return [];
-  const entries = [];
-  const seen    = new Set();
 
-  // Strategy A: single-line rows (most common for pdf-parse output)
-  for (const line of text.split('\n').map(l => l.trim()).filter(Boolean)) {
-    const e = parseSingleLine(line);
-    if (e) {
-      const key = `${e.player}|${e.team}`;
-      if (!seen.has(key)) { seen.add(key); entries.push(e); }
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const entries  = [];
+  const seen     = new Set();  // dedupe by player+team
+
+  let curDate    = '';
+  let curTime    = '';
+  let curMatchup = '';
+  let curTeam    = '';
+  let lastEntry  = null;
+
+  for (let line of lines) {
+    // ── Skip headers ─────────────────────────────────────────────────────────
+    if (SKIP_RE.test(line)) { lastEntry = null; continue; }
+
+    // ── Strip date ───────────────────────────────────────────────────────────
+    const dm = line.match(/(\d{2}\/\d{2}\/\d{4})/);
+    if (dm) { curDate = dm[1]; line = line.replace(dm[1], ''); }
+
+    // ── Strip time ───────────────────────────────────────────────────────────
+    const tm = line.match(/(\d{2}:\d{2})\(ET\)/);
+    if (tm) { curTime = tm[1] + ' ET'; line = line.replace(tm[0], ''); }
+
+    // ── Strip matchup ────────────────────────────────────────────────────────
+    const mm = line.match(/[A-Z]{2,3}@[A-Z]{2,3}/);
+    if (mm) { curMatchup = mm[0]; line = line.replace(mm[0], ''); }
+
+    // ── Strip team name (update curTeam) ─────────────────────────────────────
+    for (const key of TEAM_KEYS) {
+      const idx = line.indexOf(key);
+      if (idx !== -1) {
+        curTeam = TEAM_MAP[key];
+        // Keep only what comes after the team name
+        line = line.slice(idx + key.length);
+        break;
+      }
     }
-  }
 
-  // Strategy B: multi-line rows — join 10-line windows starting at each date line
-  if (entries.length === 0) {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    for (let i = 0; i < lines.length; i++) {
-      if (!DATE_RE.test(lines[i])) continue;
-      const combined = lines.slice(i, i + 10).join(' ');
-      const e = parseSingleLine(combined);
-      if (e) {
-        const key = `${e.player}|${e.team}`;
-        if (!seen.has(key)) { seen.add(key); entries.push(e); }
+    // ── Try player match ──────────────────────────────────────────────────────
+    const pm = line.match(PLAYER_RE);
+    if (pm) {
+      const [, lastWithComma, first, statusRaw, afterStatus] = pm;
+      const status = normaliseStatus(statusRaw);
+
+      if (status) {
+        // Convert "LastName," → "Last Name" (handle Jr./Sr. suffix)
+        let last = lastWithComma.slice(0, -1);  // drop trailing comma
+        last = last.replace(/(Jr\.|Sr\.|II|III|IV)$/, ' $1').trim();
+        const player = `${first} ${last}`;
+
+        const dedupeKey = `${player}|${curTeam}`;
+        if (!seen.has(dedupeKey)) {
+          seen.add(dedupeKey);
+          const entry = {
+            game_date:       curDate,
+            game_time:       curTime,
+            matchup:         curMatchup,
+            team:            curTeam,
+            player,
+            current_status:  status,
+            previous_status: null,
+            reason:          cleanReason(afterStatus),
+          };
+          entries.push(entry);
+          lastEntry = entry;
+        }
+      } else {
+        // Available — don't accumulate continuations
+        lastEntry = null;
+      }
+      continue;
+    }
+
+    // ── Reason continuation ──────────────────────────────────────────────────
+    // Any line that didn't match date/team/player is a continuation of the
+    // previous player's injury reason
+    if (lastEntry && line.length > 0) {
+      const extra = cleanReason(line);
+      if (extra) {
+        lastEntry.reason = lastEntry.reason
+          ? `${lastEntry.reason} ${extra}`
+          : extra;
       }
     }
   }
@@ -164,42 +219,47 @@ function parseInjuryText(text) {
   return entries;
 }
 
+// ── SAVE TO DB ────────────────────────────────────────────────────────────────
 async function saveEntries(entries, reportUrl, reportTime) {
   if (!pool || !entries.length) return 0;
   let saved = 0;
   for (const e of entries) {
     try {
-      const dp = e.game_date.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-      const pgDate = dp ? `${dp[3]}-${dp[1]}-${dp[2]}` : null;
       await pool.query(`
         INSERT INTO nba_official_injuries
-          (report_url,report_time,game_date,game_time,matchup,team,player,current_status,previous_status,reason)
+          (report_url,report_time,game_date,game_time,matchup,team,player,
+           current_status,previous_status,reason)
         VALUES ($1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10)
         ON CONFLICT (report_url,player,team) DO UPDATE
-          SET current_status=EXCLUDED.current_status,
-              previous_status=EXCLUDED.previous_status,
-              reason=EXCLUDED.reason
-      `, [reportUrl, reportTime, pgDate, e.game_time, e.matchup, e.team,
-          e.player, e.current_status, e.previous_status, e.reason || null]);
+          SET current_status  = EXCLUDED.current_status,
+              previous_status = EXCLUDED.previous_status,
+              reason          = EXCLUDED.reason
+      `, [reportUrl, reportTime, toIsoDate(e.game_date), e.game_time,
+          e.matchup, e.team, e.player, e.current_status,
+          e.previous_status, e.reason || null]);
       saved++;
     } catch (err) { console.error('[NBA Official] Save error:', err.message); }
   }
   return saved;
 }
 
+// ── MAIN POLL ─────────────────────────────────────────────────────────────────
 async function pollOfficialReport() {
   const url = getCurrentPdfUrl();
   if (url === lastProcessedUrl) return;
   console.log(`[NBA Official] Fetching ${url}`);
   try {
-    const res  = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; InjuryWire/1.0)' } });
+    const res  = await axios.get(url, {
+      responseType: 'arraybuffer', timeout: 20000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; InjuryWire/1.0)' },
+    });
     const data = await pdf(res.data);
     lastRawText = data.text;
-    console.log('[NBA Official] Raw sample:', data.text.slice(0, 400).replace(/\n/g, ' | '));
+
     const entries = parseInjuryText(data.text);
-    console.log(`[NBA Official] Parsed ${entries.length} players`);
+    console.log(`[NBA Official] Parsed ${entries.length} players from ${url}`);
     lastProcessedUrl = url;
+
     if (entries.length > 0) {
       officialCache = {};
       for (const e of entries) officialCache[e.player] = { ...e, report_url: url, report_time: new Date() };
@@ -207,10 +267,10 @@ async function pollOfficialReport() {
       const saved = await saveEntries(entries, url, new Date());
       console.log(`[NBA Official] Saved ${saved} to DB ✓`);
     } else {
-      console.warn('[NBA Official] 0 entries — visit /nba/debug to inspect raw PDF text');
+      console.warn('[NBA Official] 0 entries — visit /nba/debug to inspect raw text');
     }
   } catch (err) {
-    if ([403,404].includes(err.response?.status)) {
+    if ([403, 404].includes(err.response?.status)) {
       console.log(`[NBA Official] Not published yet (${err.response.status})`);
     } else {
       console.error('[NBA Official] Error:', err.message);
@@ -218,20 +278,32 @@ async function pollOfficialReport() {
   }
 }
 
+// ── PUBLIC HELPERS ────────────────────────────────────────────────────────────
 function getOfficialCache() {
-  return { entries: Object.values(officialCache), count: Object.keys(officialCache).length, fetched_at: officialFetchedAt };
+  return {
+    entries:    Object.values(officialCache),
+    count:      Object.keys(officialCache).length,
+    fetched_at: officialFetchedAt,
+  };
 }
 function getOfficialStatusForPlayer(name) {
   if (!name) return null;
-  return officialCache[name] || Object.values(officialCache).find(e => e.player.toLowerCase() === name.toLowerCase()) || null;
+  return officialCache[name]
+    || Object.values(officialCache).find(e => e.player.toLowerCase() === name.toLowerCase())
+    || null;
 }
 
+// ── INIT ──────────────────────────────────────────────────────────────────────
 async function startScraper(app) {
   await initOfficialDB();
+
   if (pool) {
     try {
-      const rows = await pool.query(`SELECT DISTINCT ON (player,team) * FROM nba_official_injuries
-        WHERE report_time > NOW() - INTERVAL '12 hours' ORDER BY player,team,report_time DESC`);
+      const rows = await pool.query(`
+        SELECT DISTINCT ON (player, team) * FROM nba_official_injuries
+        WHERE report_time > NOW() - INTERVAL '12 hours'
+        ORDER BY player, team, report_time DESC
+      `);
       for (const r of rows.rows) officialCache[r.player] = r;
       officialFetchedAt = new Date();
       console.log(`[NBA Official] Loaded ${rows.rowCount} entries from DB ✓`);
@@ -239,29 +311,33 @@ async function startScraper(app) {
   }
 
   if (app) {
-    app.get('/nba/injuries',     (req,res) => res.json(getOfficialCache()));
-    app.get('/nba/player/:name', (req,res) => {
+    app.get('/nba/injuries',     (req, res) => res.json(getOfficialCache()));
+    app.get('/nba/player/:name', (req, res) => {
       const e = getOfficialStatusForPlayer(req.params.name);
       return e ? res.json(e) : res.status(404).json({ error: 'Not in official report' });
     });
-    app.get('/nba/history', async (req,res) => {
-      if (!pool) return res.json({ entries:[], count:0 });
+    app.get('/nba/history', async (req, res) => {
+      if (!pool) return res.json({ entries: [], count: 0 });
       try {
-        const rows = await pool.query(`SELECT * FROM nba_official_injuries
-          WHERE report_time > NOW() - INTERVAL '7 days' ORDER BY report_time DESC LIMIT 2000`);
+        const rows = await pool.query(
+          `SELECT * FROM nba_official_injuries
+           WHERE report_time > NOW() - INTERVAL '7 days'
+           ORDER BY report_time DESC LIMIT 2000`
+        );
         res.json({ entries: rows.rows, count: rows.rowCount });
       } catch (err) { res.status(500).json({ error: err.message }); }
     });
-    app.get('/nba/latest-url', (req,res) => res.json({ last: lastProcessedUrl, current: getCurrentPdfUrl() }));
-    // Debug: returns raw PDF text so we can verify/fix the parser
-    app.get('/nba/debug', async (req,res) => {
+    app.get('/nba/latest-url', (req, res) =>
+      res.json({ last: lastProcessedUrl, current: getCurrentPdfUrl() })
+    );
+    app.get('/nba/debug', async (req, res) => {
       const url = getCurrentPdfUrl();
       try {
-        const r = await axios.get(url, { responseType:'arraybuffer', timeout:20000 });
+        const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
         const d = await pdf(r.data);
-        res.json({ url, text: d.text.slice(0,4000), total_length: d.text.length });
+        res.json({ url, text: d.text.slice(0, 4000), total_length: d.text.length });
       } catch (err) {
-        res.json({ url, error: err.message, cached_text: lastRawText.slice(0,4000) });
+        res.json({ url, error: err.message, cached_text: lastRawText.slice(0, 4000) });
       }
     });
   }
