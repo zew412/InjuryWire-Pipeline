@@ -123,7 +123,7 @@ function toIsoDate(d) {
 //        "McCullarJr.,KevinOutGLeague-Two-Way"
 //
 // Regex captures: (LastName,)(FirstName)(Status)(rest)
-const PLAYER_RE = /^([A-Z][A-Za-z'.]*(?:Jr\.|Sr\.|II|III|IV)?,)([A-Z][A-Za-z'.]*)(Out|Doubtful|Questionable|Probable|Available)(.*)/;
+const PLAYER_RE = /^([A-Z][A-Za-z'.\-]*(?:Jr\.|Sr\.|II|III|IV)?,)([A-Z][A-Za-z'.\s]*?)(Out|Doubtful|Questionable|Probable|Available)(.*)/;
 
 // Lines that are page/section headers — reset context, skip
 const SKIP_RE = /^InjuryReport:|^Page\d+of|^GameDate/;
@@ -178,7 +178,9 @@ function parseInjuryText(text) {
         // Convert "LastName," → "Last Name" (handle Jr./Sr. suffix)
         let last = lastWithComma.slice(0, -1);  // drop trailing comma
         last = last.replace(/(Jr\.|Sr\.|II|III|IV)$/, ' $1').trim();
-        const player = `${first} ${last}`;
+        // Split CamelCase in first name (e.g. "YanicKonan" → "Yanic Konan")
+        const firstNorm = first.trim().replace(/([a-z])([A-Z])/g, '$1 $2');
+        const player = `${firstNorm} ${last}`;
 
         const dedupeKey = `${player}|${curTeam}`;
         if (!seen.has(dedupeKey)) {
