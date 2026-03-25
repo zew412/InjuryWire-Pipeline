@@ -16,6 +16,7 @@ const express = require('express');
 const axios   = require('axios');
 const cors    = require('cors');
 const { Pool } = require('pg');
+const nbaScraper = require('./nba-scraper');
 
 const app  = express();
 app.use(cors());
@@ -1383,6 +1384,9 @@ async function start() {
   // Poll immediately then every minute
   await poll();
   setInterval(poll, 60000);
+
+  // Start NBA official injury report scraper
+  await nbaScraper.startScraper(app);
 }
 
 start();
