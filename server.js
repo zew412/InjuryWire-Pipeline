@@ -741,6 +741,61 @@ function extractInjuryType(text) {
   return 'Undisclosed';
 }
 
+/**
+ * extractMultiplePlayers — parses a tweet that mentions multiple players
+ * with potentially different statuses.
+ *
+ * Returns array of { player, status, body_part, injury_type, cleared }
+ * "cleared" = true means the player was cleared/removed from injury report.
+ *
+ * Examples handled:
+ *   "Kawhi is questionable. Mathurin is cleared to play."
+ *   "Kawhi Leonard (knee) is OUT. Jordan Miller is questionable with back soreness."
+ *   "Mathurin and Collins are no longer on the injury report."
+ */
+function extractMultiplePlayers(text) {
+  const CLEARED_PATTERN = /no longer on the injury report|cleared to play|cleared to return|removed from the injury report|not on the injury report|available to play/i;
+
+  // Split on sentence boundaries and "also" conjunctions
+  const segments = text
+    .split(/(?<=[.!?])\s+|(?:\band\b(?=\s+[A-Z]))/g)
+    .map(s => s.trim())
+    .filter(s => s.length > 5);
+
+  const results = [];
+
+  for (const seg of segments) {
+    // Check if this segment clears multiple players: "Mathurin and Collins are no longer..."
+    if (CLEARED_PATTERN.test(seg)) {
+      // Find all player names in this segment
+      const combined = { ...ROSTER_FALLBACK, ...rosterCache };
+      for (const name of Object.keys(combined)) {
+        if (name.length < 5) continue;
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`\\b${escaped}\\b`, 'i').test(seg)) {
+          results.push({ player: name, status: 'Available', body_part: 'undisclosed', injury_type: 'Undisclosed', cleared: true });
+        }
+      }
+      continue;
+    }
+
+    // Normal injury segment — extract one player + status
+    const player = extractPlayer(seg);
+    if (!player) continue;
+
+    const status     = extractStatus(seg);
+    const body_part  = extractBodyPart(seg);
+    const injury_type = extractInjuryType(seg);
+
+    results.push({ player, status, body_part, injury_type, cleared: false });
+  }
+
+  // Deduplicate by player name (last mention wins)
+  const seen = new Map();
+  for (const r of results) seen.set(r.player.toLowerCase(), r);
+  return [...seen.values()];
+}
+
 function extractPlayer(text) {
   // Build a combined lookup: ROSTER_FALLBACK is always available immediately on startup.
   // rosterCache is populated once balldontlie loads. Use both.
@@ -1049,59 +1104,74 @@ async function poll() {
 
     seenTweetIds.add(tweet.id);
 
-    const player    = extractPlayer(tweet.text);
-    if (!player) continue;
-
-    const status    = extractStatus(tweet.text);
-    const body_part = extractBodyPart(tweet.text);
-    const injury_type = extractInjuryType(tweet.text);
-
-    // Use live roster for authoritative team/position
-    const rosterEntry = getRosterEntry(player);
-    const position  = normalizePosition(rosterEntry?.position, player) || null;
-    const team      = rosterEntry?.team
-      || (reporter.team === 'All Teams' ? 'Unknown' : reporter.team);
+    // Extract all player/status pairs from this tweet
+    const extractions = extractMultiplePlayers(tweet.text);
+    if (extractions.length === 0) continue;
 
     const tweetTime = tweet.created_at ? new Date(tweet.created_at) : new Date();
 
-    // Look up history for this player — must happen before calcConfidence
-    const [prev_status, days_since_last_report] = await Promise.all([
-      getPrevStatus(player),
-      getDaysSinceLastReport(player),
-    ]);
+    for (const extraction of extractions) {
+      const { player, status, body_part, injury_type, cleared } = extraction;
 
-    const confidence = calcConfidence(reporter, status, tweet.text, 0, { daysSinceLastReport: days_since_last_report });
-    const gameInfo  = getGameInfo(team, tweet.text, tweetTime);
+      // If player is cleared, remove any matching active report from cache
+      if (cleared) {
+        const idx = injuryCache.findIndex(r =>
+          r.player?.toLowerCase() === player.toLowerCase() &&
+          r.team === (getRosterEntry(player)?.team || reporter.team)
+        );
+        if (idx !== -1) {
+          console.log(`  [Cleared] ${player} removed from injury report`);
+          injuryCache.splice(idx, 1);
+        }
+        continue;
+      }
 
-    const report = {
-      tweet_id:    tweet.id,
-      player,
-      position,
-      team,
-      status,
-      injury_type,
-      body_part,
-      matchup:     gameInfo.matchup,
-      game_date:   gameInfo.game_date,
-      game_time:   gameInfo.game_time,
-      in_game:     gameInfo.in_game || false,
-      reporter:    reporter.name,
-      outlet:      reporter.outlet,
-      tier:        reporter.tier,
-      confidence,
-      time_of_report: tweetTime.toISOString(),
-      prev_status,
-      days_since_last_report,
-      tweet_text:  tweet.text,
-      corroborators: [],
-      corrobTweets: [],
-      // for dashboard compat
-      handle:      '@' + reporter.handle,
-      injury:      `${injury_type !== 'Undisclosed' ? injury_type + ' — ' : ''}${body_part}`,
-      body:        body_part,
-      timestamp:   tweetTime.toISOString(),
-      tweetId:     tweet.id,
-    };
+      // Use live roster for authoritative team/position
+      const rosterEntry = getRosterEntry(player);
+      const position  = normalizePosition(rosterEntry?.position, player) || null;
+      const team      = rosterEntry?.team
+        || (reporter.team === 'All Teams' ? 'Unknown' : reporter.team);
+
+      // Look up history for this player — must happen before calcConfidence
+      const [prev_status, days_since_last_report] = await Promise.all([
+        getPrevStatus(player),
+        getDaysSinceLastReport(player),
+      ]);
+
+      const confidence = calcConfidence(reporter, status, tweet.text, 0, { daysSinceLastReport: days_since_last_report });
+      const gameInfo  = getGameInfo(team, tweet.text, tweetTime);
+
+      // Use a composite tweet_id for multi-player tweets to avoid DB conflicts
+      const tweet_id = extractions.length > 1 ? `${tweet.id}_${player.replace(/\s+/g, '_')}` : tweet.id;
+
+      const report = {
+        tweet_id,
+        player,
+        position,
+        team,
+        status,
+        injury_type,
+        body_part,
+        matchup:     gameInfo.matchup,
+        game_date:   gameInfo.game_date,
+        game_time:   gameInfo.game_time,
+        in_game:     gameInfo.in_game || false,
+        reporter:    reporter.name,
+        outlet:      reporter.outlet,
+        tier:        reporter.tier,
+        confidence,
+        time_of_report: tweetTime.toISOString(),
+        prev_status,
+        days_since_last_report,
+        tweet_text:  tweet.text,
+        corroborators: [],
+        corrobTweets: [],
+        handle:      '@' + reporter.handle,
+        injury:      `${injury_type !== 'Undisclosed' ? injury_type + ' — ' : ''}${body_part}`,
+        body:        body_part,
+        timestamp:   tweetTime.toISOString(),
+        tweetId:     tweet.id, // always link to original tweet
+      };
 
     // ── Corroboration: same player + same game + compatible status → group tweets ─
     // "Compatible status" means we don't group an "Out" with a "Questionable" —
@@ -1186,7 +1256,8 @@ async function poll() {
     injuryCache.unshift(report);
     await saveReport(report);
     found++;
-  }
+    } // end inner for (extraction of extractions)
+  } // end outer for (tweet of allTweets)
 
   // Prune memory to last 24h
   const cutoff = Date.now() - 86400000;
