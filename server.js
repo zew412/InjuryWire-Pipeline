@@ -52,7 +52,6 @@ async function initDB() {
         tweet_text            TEXT,
         corroborators         TEXT[],
         corrob_tweets         JSONB DEFAULT '[]',
-        in_game               BOOLEAN DEFAULT FALSE,
         created_at            TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_player   ON injury_reports(player);
@@ -62,8 +61,7 @@ async function initDB() {
     `);
     await pool.query(`
       ALTER TABLE injury_reports
-      ADD COLUMN IF NOT EXISTS corrob_tweets JSONB DEFAULT '[]',
-      ADD COLUMN IF NOT EXISTS in_game BOOLEAN DEFAULT FALSE
+      ADD COLUMN IF NOT EXISTS corrob_tweets JSONB DEFAULT '[]'
     `);
     console.log('[DB] Schema ready ✓');
   } catch (err) {
@@ -322,17 +320,23 @@ async function fetchSchedule() {
   const BDLKEY = process.env.BALLDONTLIE_KEY;
   if (!BDLKEY) return;
 
+  // Don't refetch more than once per hour
   if (scheduleFetchedAt && (Date.now() - scheduleFetchedAt) < 3600000) return;
 
   try {
-    // Fetch today + next 2 days — keeps API calls low, covers immediate reporting window
-    const dates = Array.from({ length: 3 }, (_, d) => {
+    // Use ET dates — a game at 8 PM ET on Mar 24 should be stored as Mar 24, not Mar 25 UTC
+    const pad = n => String(n).padStart(2, '0');
+    const etDateStr = dt => {
+      const e = new Date(dt.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      return `${e.getFullYear()}-${pad(e.getMonth()+1)}-${pad(e.getDate())}`;
+    };
+    const dates = [0, 1, 2, 3].map(d => {
       const dt = new Date();
       dt.setDate(dt.getDate() + d);
-      return dt.toISOString().split('T')[0];
+      return etDateStr(dt);
     });
 
-    const allGames = {};
+    const allGames = {}; // team → [games]
 
     for (const date of dates) {
       const res = await axios.get('https://api.balldontlie.io/v1/games', {
@@ -348,10 +352,13 @@ async function fetchSchedule() {
         if (!home || !away) continue;
 
         const matchup = `${away} @ ${home}`;
+
+        // Parse game_time — balldontlie gives UTC ISO datetime in g.date or g.status
         let game_time = null;
         let game_datetime_utc = null;
 
         if (g.status && /\d:\d\d/.test(g.status)) {
+          // Already formatted like "7:30 pm ET"
           game_time = g.status;
         } else if (g.date) {
           const d = new Date(g.date);
@@ -362,16 +369,11 @@ async function fetchSchedule() {
           }) + ' ET';
         }
 
-        const entry = {
-          matchup,
-          game_date: date,
-          game_time,
-          game_datetime_utc,
-          bdl_status: g.status || null, // "Final", "7:30 pm ET", "In Progress"
-        };
+        const entry = { matchup, game_date: date, game_time, game_datetime_utc };
 
         [home, away].forEach(team => {
           if (!allGames[team]) allGames[team] = [];
+          // Avoid duplicate dates
           if (!allGames[team].find(e => e.game_date === date)) {
             allGames[team].push(entry);
           }
@@ -379,6 +381,7 @@ async function fetchSchedule() {
       }
     }
 
+    // Sort each team's games chronologically
     for (const team of Object.keys(allGames)) {
       allGames[team].sort((a, b) => a.game_date.localeCompare(b.game_date));
     }
@@ -387,28 +390,24 @@ async function fetchSchedule() {
     scheduleFetchedAt = Date.now();
 
     const totalGames = Object.values(allGames).reduce((sum, arr) => sum + arr.length, 0) / 2;
-    console.log(`[Schedule] Cached ${totalGames} games across 10 days`);
+    console.log(`[Schedule] Cached ${totalGames} games across ${dates.length} days`);
   } catch (err) {
     console.warn('[Schedule] Fetch failed:', err.message);
   }
 }
 
-// NBA games average ~2h 15m. 2h 30m gives buffer for overtime.
-const NBA_GAME_DURATION_MS = 150 * 60 * 1000;
-
 /**
- * getGameInfo — assigns a report to the correct game.
+ * getGameInfo — returns the correct game entry for a team given tweet context.
  *
- * Cases:
- *  1. Tweet says "tonight"/"today" → today's game only
- *  2. Tweet says "tomorrow" → tomorrow's game only
- *  3. No hint, team plays today:
- *     - Game not started → pre-game report for today
- *     - Game started < 2h30m ago → IN-GAME injury (flagged)
- *     - Game finished → assign to next future game
- *  4. No hint, no game today → next upcoming game (up to 10 days out)
- *  5. Nothing found → null
+ * Logic:
+ *  1. If tweet says "tonight" / "out tonight" / "tonight's game" → use today's game only
+ *  2. If tweet says "tomorrow" → use tomorrow's game
+ *  3. If no temporal hint: use the next upcoming game after tweet time
+ *     (i.e. the earliest game that hasn't already ended)
+ *  4. Never assign a game that was played >6 hours before the tweet
  */
+const NBA_GAME_DURATION_MS = 150 * 60 * 1000; // 2h 30m
+
 function getGameInfo(team, tweetText = '', tweetTime = null) {
   const games = scheduleCache[team];
   if (!games || games.length === 0) {
@@ -418,14 +417,14 @@ function getGameInfo(team, tweetText = '', tweetTime = null) {
   const tw  = (tweetText || '').toLowerCase();
   const now = tweetTime ? new Date(tweetTime) : new Date();
 
-  const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const pad   = n => String(n).padStart(2, '0');
-  const toStr = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  const todayStr    = toStr(etNow);
+  const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const toET  = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const todayStr    = toET(etNow);
   const tomorrowET  = new Date(etNow); tomorrowET.setDate(etNow.getDate() + 1);
-  const tomorrowStr = toStr(tomorrowET);
+  const tomorrowStr = toET(tomorrowET);
 
-  // ── 1. Explicit temporal signals ─────────────────────────────────────────────
+  // ── Explicit temporal signals ─────────────────────────────────────────────────
   const mentionsTonight  = /\btonight\b|out tonight|tonight's game|\btoday\b/.test(tw);
   const mentionsTomorrow = /\btomorrow\b|tomorrow's game/.test(tw);
 
@@ -439,32 +438,26 @@ function getGameInfo(team, tweetText = '', tweetTime = null) {
     return g ? { ...g, in_game: false } : { matchup: null, game_date: null, game_time: null, in_game: false };
   }
 
-  // ── 2. Check today's game state ───────────────────────────────────────────────
+  // ── No hint — check today's game state ───────────────────────────────────────
   const todayGame = games.find(g => g.game_date === todayStr);
 
   if (todayGame) {
     if (todayGame.bdl_status === 'Final') {
-      // Game is over — fall through to next game
+      // Game over — fall through to next game
     } else if (todayGame.game_datetime_utc) {
-      const gameStart = new Date(todayGame.game_datetime_utc);
-      const elapsed   = now.getTime() - gameStart.getTime();
-
-      if (elapsed < 0) {
-        // Pre-game
-        return { ...todayGame, in_game: false };
-      } else if (elapsed < NBA_GAME_DURATION_MS) {
-        // Game is likely live — in-game injury
-        console.log(`  [In-game] ${team} game ${Math.round(elapsed/60000)}min elapsed`);
-        return { ...todayGame, in_game: true };
+      const elapsed = now.getTime() - new Date(todayGame.game_datetime_utc).getTime();
+      if (elapsed < 0) return { ...todayGame, in_game: false };           // pre-game
+      if (elapsed < NBA_GAME_DURATION_MS) {
+        console.log(`  [In-game] ${team} ~${Math.round(elapsed/60000)}min elapsed`);
+        return { ...todayGame, in_game: true };                           // live game
       }
-      // Game likely over — fall through to next game
+      // Game likely over — find next
     } else {
-      // No UTC time available — assume today is valid
-      return { ...todayGame, in_game: false };
+      return { ...todayGame, in_game: false }; // no UTC time, assume valid
     }
   }
 
-  // ── 3. Find next future game ──────────────────────────────────────────────────
+  // ── Find next future game ─────────────────────────────────────────────────────
   for (const g of games) {
     if (g.game_date > todayStr) return { ...g, in_game: false };
   }
@@ -975,13 +968,13 @@ async function saveReport(r) {
     await pool.query(`
       INSERT INTO injury_reports
         (tweet_id, player, position, team, status, injury_type, body_part,
-         matchup, game_date, game_time, in_game, reporter, outlet, tier, confidence,
+         matchup, game_date, game_time, reporter, outlet, tier, confidence,
          time_of_report, prev_status, days_since_last_report, tweet_text, corroborators, corrob_tweets)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
       ON CONFLICT (tweet_id) DO NOTHING
     `, [
       r.tweet_id, r.player, r.position, r.team, r.status, r.injury_type, r.body_part,
-      r.matchup, r.game_date, r.game_time, r.in_game || false, r.reporter, r.outlet, r.tier, r.confidence,
+      r.matchup, r.game_date, r.game_time, r.reporter, r.outlet, r.tier, r.confidence,
       r.time_of_report, r.prev_status, r.days_since_last_report, r.tweet_text,
       r.corroborators || [],
       JSON.stringify(r.corrobTweets || []),
@@ -1127,9 +1120,9 @@ async function poll() {
     const existing = injuryCache.find(r =>
       r.player && player &&
       r.player.toLowerCase() === player.toLowerCase() &&
-      r.team === team &&  // must be same team — prevents cross-team false matches
+      r.team === team &&
       statusGroup(r.status) === statusGroup(status) &&
-      r.game_date !== null && gameInfo.game_date !== null &&  // don't group on null dates
+      r.game_date !== null && gameInfo.game_date !== null &&
       r.game_date === gameInfo.game_date &&
       Math.abs(new Date(r.time_of_report).getTime() - tweetTime.getTime()) < SIX_HOURS
     );
@@ -1289,13 +1282,10 @@ async function start() {
   // Load last 24h from DB into memory on startup
   const existing = await loadRecentFromDB(24);
   existing.forEach(r => {
-    // Skip reports with no player or no reporter — these are bad old records
     if (!r.player || r.player === 'Unknown Player') return;
     if (!r.reporter) return;
-
     const reporterObj = REPORTERS.find(x => x.name === r.reporter);
     const handle = reporterObj ? '@' + reporterObj.handle : (r.handle || '');
-
     injuryCache.push({
       ...r,
       handle,
@@ -1307,6 +1297,8 @@ async function start() {
       in_game: r.in_game || false,
     });
     if (r.tweet_id) seenTweetIds.add(r.tweet_id);
+    (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
+  });
     (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
   });
   console.log(`[Start] Loaded ${injuryCache.length} reports from DB`);
