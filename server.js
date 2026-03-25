@@ -1299,8 +1299,6 @@ async function start() {
     if (r.tweet_id) seenTweetIds.add(r.tweet_id);
     (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
   });
-    (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
-  });
   console.log(`[Start] Loaded ${injuryCache.length} reports from DB`);
 
   app.listen(PORT, () => {
