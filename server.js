@@ -16,7 +16,6 @@ const express = require('express');
 const axios   = require('axios');
 const cors    = require('cors');
 const { Pool } = require('pg');
-const nbaScraper = require('./nba-scraper');
 
 const app  = express();
 app.use(cors());
@@ -1174,46 +1173,60 @@ async function poll() {
         tweetId:     tweet.id, // always link to original tweet
       };
 
-    // ── Corroboration: same player + same game + compatible status → group tweets ─
-    // "Compatible status" means we don't group an "Out" with a "Questionable" —
-    // those are different reports about different designations.
-    // We allow grouping across minor status variants (e.g. two reporters both say Out).
-    // Window: 6 hours — gives time for multiple reporters to pick up the same story.
+    // ── One card per player per game_date ────────────────────────────────────
+    // Any tweet about the same player for the same game day merges into one card.
+    // If the status is an upgrade (e.g. Q → Out), update the card's status.
+    // All contributing tweets are stored in corrobTweets for display.
     const SIX_HOURS = 6 * 60 * 60 * 1000;
 
-    const statusGroup = s => {
-      if (s === 'Out' || s === 'Doubtful') return 'out-doubtful';
-      if (s === 'Game-Time Decision') return 'gtd';
-      if (s === 'Questionable') return 'questionable';
-      return 'probable';
-    };
+    // Status severity — higher = more definitive
+    const statusSeverity = s => ({ 'Out': 4, 'Doubtful': 3, 'Game-Time Decision': 2, 'Questionable': 1, 'Probable': 0 }[s] ?? 1);
 
     const existing = injuryCache.find(r =>
       r.player && player &&
       r.player.toLowerCase() === player.toLowerCase() &&
       r.team === team &&
-      statusGroup(r.status) === statusGroup(status) &&
       r.game_date !== null && gameInfo.game_date !== null &&
-      r.game_date === gameInfo.game_date &&
-      Math.abs(new Date(r.time_of_report).getTime() - tweetTime.getTime()) < SIX_HOURS
+      r.game_date === gameInfo.game_date
     );
 
     if (existing) {
-      if (!existing.corroborators.includes(reporter.name)) {
-        existing.corroborators.push(reporter.name);
-        existing.corrobTweets = existing.corrobTweets || [];
+      // Always add this tweet to the card's tweet history
+      existing.corrobTweets = existing.corrobTweets || [];
+      const alreadyLinked = existing.corrobTweets.some(ct => ct.tweetId === tweet.id);
+
+      if (!alreadyLinked) {
         existing.corrobTweets.push({
-          reporter: reporter.name,
-          handle:   '@' + reporter.handle,
-          tweet:    tweet.text,
-          tweetId:  tweet.id,
-          outlet:   reporter.outlet,
-          tier:     reporter.tier,
+          reporter:  reporter.name,
+          handle:    '@' + reporter.handle,
+          tweet:     tweet.text,
+          tweetId:   tweet.id,
+          outlet:    reporter.outlet,
+          tier:      reporter.tier,
+          status,                             // what this tweet reported
           timestamp: tweetTime.toISOString(),
         });
-        seenTweetIds.add(tweet.id); // also mark as seen so it's never reprocessed
+        seenTweetIds.add(tweet.id);
 
-        // Recalculate confidence with new corroboration count
+        // Update status if this tweet reports something more definitive
+        const upgraded = statusSeverity(status) > statusSeverity(existing.status);
+        if (upgraded) {
+          console.log(`  [Status↑] ${player}: ${existing.status} → ${status} (per ${reporter.name})`);
+          existing.status    = status;
+          existing.reporter  = reporter.name;  // most recent authoritative source
+          existing.handle    = '@' + reporter.handle;
+          existing.outlet    = reporter.outlet;
+          existing.tier      = reporter.tier;
+          existing.tweet_text = tweet.text;
+          if (body_part && body_part !== 'undisclosed') existing.body_part = body_part;
+          if (injury_type && injury_type !== 'Undisclosed') existing.injury_type = injury_type;
+        }
+
+        if (!existing.corroborators.includes(reporter.name)) {
+          existing.corroborators.push(reporter.name);
+        }
+
+        // Recalculate confidence with updated corroboration + possible status upgrade
         const existingReporter = REPORTERS.find(r => r.name === existing.reporter)
           || { tier: existing.tier || 2, signal: 'Medium', outlet: existing.outlet || '' };
         existing.confidence = calcConfidence(
@@ -1222,22 +1235,26 @@ async function poll() {
           { daysSinceLastReport: existing.days_since_last_report }
         );
 
-        // Persist corrob_tweets + updated confidence to DB
+        // Persist full update to DB
         await pool?.query(
           `UPDATE injury_reports
-           SET corroborators = $1, corrob_tweets = $2, confidence = $3
-           WHERE tweet_id = $4`,
+           SET corroborators = $1, corrob_tweets = $2, confidence = $3,
+               status = $4, reporter = $5, tweet_text = $6
+           WHERE tweet_id = $7`,
           [
             existing.corroborators,
             JSON.stringify(existing.corrobTweets),
             existing.confidence,
+            existing.status,
+            existing.reporter,
+            existing.tweet_text,
             existing.tweet_id,
           ]
         );
 
-        console.log(`  [+Corrob] ${reporter.name} → "${player}" (${status}) | now ${existing.corroborators.length + 1} sources`);
+        console.log(`  [+Tweet] ${reporter.name} → "${player}" (${status}) | ${existing.corrobTweets.length} tweets total`);
       } else {
-        console.log(`  [Skip dupe] ${reporter.name} already listed for ${player}`);
+        console.log(`  [Skip dupe] tweet ${tweet.id} already linked to ${player}`);
       }
       continue;
     }
@@ -1384,9 +1401,6 @@ async function start() {
   // Poll immediately then every minute
   await poll();
   setInterval(poll, 60000);
-
-  // Start NBA official injury report scraper
-  await nbaScraper.startScraper(app);
 }
 
 start();
