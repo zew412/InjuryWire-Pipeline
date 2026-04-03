@@ -174,6 +174,12 @@ function parseInjuryText(text) {
       const [, lastWithComma, first, statusRaw, afterStatus] = pm;
       const status = normaliseStatus(statusRaw);
 
+      // Skip G-League / Two-Way / Assignment designations — not main roster
+      if (/GLeague|G-League|TwoWay|Two-Way|Assignment/i.test(afterStatus)) {
+        lastEntry = null;
+        continue;
+      }
+
       if (status) {
         // Convert "LastName," → "Last Name" (handle Jr./Sr. suffix)
         let last = lastWithComma.slice(0, -1);  // drop trailing comma
