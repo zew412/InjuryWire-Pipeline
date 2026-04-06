@@ -16,6 +16,7 @@ const express = require('express');
 const axios   = require('axios');
 const cors    = require('cors');
 const { Pool } = require('pg');
+const { startScraper, getOfficialCache, getOfficialStatusForPlayer } = require('./nba-scraper');
 
 const app  = express();
 app.use(cors());
@@ -1321,7 +1322,46 @@ app.get('/health', (req, res) => {
 // Live feed — last 24h, newest first (dashboard compatible)
 app.get('/v1/injuries/live', auth, (req, res) => {
   const statusOrder = { Out: 0, Doubtful: 1, Questionable: 2, 'Game-Time Decision': 3, Probable: 4 };
-  const sorted = [...injuryCache].sort((a, b) =>
+
+  // Merge official NBA injury report entries with tweet-based reports
+  // Official entries take the form of scraper data — convert to card format
+  const official = getOfficialCache();
+  const officialCards = official.entries
+    .filter(e => e.current_status) // already filtered G-League in scraper
+    .map(e => ({
+      tweet_id:    `official_${e.player}_${e.game_date}`,
+      player:      e.player,
+      team:        e.team,
+      status:      e.current_status,
+      body_part:   e.reason || null,
+      injury_type: e.reason || null,
+      matchup:     e.matchup || null,
+      game_date:   e.game_date || null,
+      game_time:   e.game_time || null,
+      reporter:    'NBA Official Report',
+      handle:      '@NBA',
+      outlet:      'official.nba.com',
+      tier:        1,
+      confidence:  64, // official reports are high signal but no tweet precision
+      time_of_report: e.report_time || new Date(),
+      tweet_text:  e.reason || '',
+      corroborators: [],
+      corrobTweets: [],
+      source:      'official',
+      report_url:  e.report_url || null,
+      in_game:     false,
+    }));
+
+  // Merge: tweet reports take priority over official for same player+game_date
+  const tweetPlayerDates = new Set(
+    injuryCache.map(r => `${r.player}|${r.game_date}`)
+  );
+  const officialOnly = officialCards.filter(
+    e => !tweetPlayerDates.has(`${e.player}|${e.game_date}`)
+  );
+
+  const combined = [...injuryCache, ...officialOnly];
+  const sorted = combined.sort((a, b) =>
     (statusOrder[a.status] ?? 5) - (statusOrder[b.status] ?? 5) || b.confidence - a.confidence
   );
   res.json({ injuries: sorted, count: sorted.length, as_of: new Date() });
@@ -1397,6 +1437,9 @@ async function start() {
     console.log(`  BALLDONTLIE_KEY: ${process.env.BALLDONTLIE_KEY ? '✓' : '✗ not set (schedule disabled)'}`);
     console.log(`  API_KEY:         ${process.env.API_KEY ? '✓' : 'open (no auth)'}`);
   });
+
+  // Start NBA official injury report scraper
+  await startScraper(app);
 
   // Poll immediately then every minute
   await poll();
