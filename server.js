@@ -1183,13 +1183,21 @@ async function poll() {
     // Status severity — higher = more definitive
     const statusSeverity = s => ({ 'Out': 4, 'Doubtful': 3, 'Game-Time Decision': 2, 'Questionable': 1, 'Probable': 0 }[s] ?? 1);
 
-    const existing = injuryCache.find(r =>
-      r.player && player &&
-      r.player.toLowerCase() === player.toLowerCase() &&
-      r.team === team &&
-      r.game_date !== null && gameInfo.game_date !== null &&
-      r.game_date === gameInfo.game_date
-    );
+    const existing = injuryCache.find(r => {
+      if (!r.player || !player) return false;
+      if (r.player.toLowerCase() !== player.toLowerCase()) return false;
+      if (r.team !== team) return false;
+
+      // If both have game_date, match on that
+      if (r.game_date && gameInfo.game_date) {
+        return r.game_date === gameInfo.game_date;
+      }
+
+      // Fallback: if either is missing game_date, match if tweets are same calendar day ET
+      const rDate = new Date(r.time_of_report).toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+      const tDate = tweetTime.toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+      return rDate === tDate;
+    });
 
     if (existing) {
       // Always add this tweet to the card's tweet history
@@ -1415,7 +1423,8 @@ async function start() {
     if (!r.reporter) return;
     const reporterObj = REPORTERS.find(x => x.name === r.reporter);
     const handle = reporterObj ? '@' + reporterObj.handle : (r.handle || '');
-    injuryCache.push({
+
+    const mapped = {
       ...r,
       handle,
       injury: `${r.injury_type && r.injury_type !== 'Undisclosed' ? r.injury_type + ' — ' : ''}${r.body_part || ''}`,
@@ -1424,7 +1433,39 @@ async function start() {
       tweetId: r.tweet_id,
       corrobTweets: r.corrob_tweets || [],
       in_game: r.in_game || false,
-    });
+    };
+
+    // Deduplicate: if we already have a card for this player+game_date, merge into it
+    const rDateET = new Date(r.time_of_report).toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+    const dup = injuryCache.find(c =>
+      c.player?.toLowerCase() === r.player?.toLowerCase() &&
+      c.team === r.team &&
+      (c.game_date && r.game_date
+        ? c.game_date === r.game_date
+        : new Date(c.time_of_report).toLocaleDateString('en-US', { timeZone: 'America/New_York' }) === rDateET)
+    );
+
+    if (dup) {
+      // Merge: keep whichever has the more severe status
+      const severity = s => ({ Out: 4, Doubtful: 3, 'Game-Time Decision': 2, Questionable: 1, Probable: 0 }[s] ?? 1);
+      if (severity(r.status) > severity(dup.status)) {
+        dup.status   = r.status;
+        dup.reporter = r.reporter;
+        dup.handle   = handle;
+      }
+      // Merge corrobTweets
+      const existingIds = new Set((dup.corrobTweets || []).map(ct => ct.tweetId));
+      (mapped.corrobTweets || []).forEach(ct => {
+        if (ct.tweetId && !existingIds.has(ct.tweetId)) dup.corrobTweets.push(ct);
+      });
+      if (r.tweet_id && !existingIds.has(r.tweet_id)) {
+        dup.corrobTweets.push({ reporter: r.reporter, handle, tweetId: r.tweet_id, tweet: r.tweet_text, outlet: r.outlet, tier: r.tier, timestamp: r.time_of_report });
+      }
+      if (r.tweet_id) seenTweetIds.add(r.tweet_id);
+      return; // don't push a duplicate card
+    }
+
+    injuryCache.push(mapped);
     if (r.tweet_id) seenTweetIds.add(r.tweet_id);
     (r.corrob_tweets || []).forEach(ct => { if (ct.tweetId) seenTweetIds.add(ct.tweetId); });
   });
